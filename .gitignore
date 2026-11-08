@@ -1,0 +1,71 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
+
+# Claude Code: personal settings (project settings in .claude/settings.json are tracked)
+.claude/settings.local.json
+
+# Secrets
+.env
+.env.*
+
+# ---------------------------------------------------------------------------
+# Data — never commit images, crops, checkpoints or the raw dataset.
+# Raw data lives outside the repo (/home/qq/Pictures/MFG_det).
+# ---------------------------------------------------------------------------
+
+# Images anywhere in the repo (micrographs, crops, anomaly maps, figures).
+# Add a targeted "!path/to/file.png" exception below if a figure must be tracked.
+*.png
+*.PNG
+*.jpg
+*.JPG
+*.jpeg
+*.tif
+*.tiff
+*.bmp
+*.gif
+*.webp
+
+# data/: only top-level CSV files (manifest.csv, corrections_proposed.csv) are tracked;
+# everything else, including any sub-folder (crop cache, feature cache), is ignored.
+data/*
+!data/.gitkeep
+!data/*.csv
+
+# Model checkpoints, weights and array/feature caches
+*.ckpt
+*.pt
+*.pth
+*.safetensors
+*.onnx
+*.npy
+*.npz
+*.pkl
+*.pickle
+*.joblib
+*.h5
+*.hdf5
+*.parquet
+checkpoints/
+cache/
+lightning_logs/
+runs/
+wandb/
+mlruns/

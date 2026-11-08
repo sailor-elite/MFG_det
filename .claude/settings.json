@@ -1,0 +1,34 @@
+{
+  "permissions": {
+    "defaultMode": "default",
+    "disableBypassPermissionsMode": "disable",
+    "disableAutoMode": "disable",
+    "ask": [
+      "Bash(git commit *)",
+      "Bash(uv add *)",
+      "Bash(uv remove *)"
+    ],
+    "deny": [
+      "Edit(//home/qq/Pictures/MFG_det/**)",
+      "Edit(/CLAUDE.md)",
+      "Edit(/.claude/**)",
+      "Bash(rm *)",
+      "Bash(rmdir *)",
+      "Bash(shred *)",
+      "Bash(unlink *)",
+      "Bash(sudo *)",
+      "Bash(chmod *)",
+      "Bash(chown *)",
+      "Bash(git push *)",
+      "Bash(git reset *)",
+      "Bash(git clean *)",
+      "Bash(git restore *)",
+      "Bash(git checkout *)",
+      "Bash(git rebase *)",
+      "Bash(git branch -D *)",
+      "Bash(git stash drop *)",
+      "Bash(curl *)",
+      "Bash(wget *)"
+    ]
+  }
+}
