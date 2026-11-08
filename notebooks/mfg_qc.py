@@ -1,6 +1,7 @@
 # ---
 # jupyter:
 #   jupytext:
+#     formats: ipynb,py:percent
 #     text_representation:
 #       extension: .py
 #       format_name: percent
@@ -26,6 +27,7 @@ import pandas as pd
 # %%
 RAW_DIR = Path("/home/qq/Pictures/MFG_det")  # raw micrographs, READ ONLY
 MFG_DIR = Path("/home/qq/mfg_qc/data/MFG")    # copies of the raw images, one folder per label
+EXCLUDED_CSV = Path("/home/qq/mfg_qc/data/excluded_images.csv")  # images removed for bad quality
 
 # Image number -> label for A preparations (CLAUDE.md §7.2): (last image number, label)
 LABELS_A = [
@@ -158,6 +160,27 @@ data["PICTURES_BY_LABEL"] = {}
 for p in data["RAW_PICTURES"]:
     data["PICTURES_BY_LABEL"].setdefault(label_of(p), []).append(p)
 
+{label: len(paths) for label, paths in data["PICTURES_BY_LABEL"].items()}
+
+# %% [markdown]
+# **Excluded images (bad quality).** After a visual review, 31 images labelled `good` were found
+# to be blurry (accidental defocus) and are removed from the dataset. The list with the reason is in
+# `data/excluded_images.csv`. Only the dataset in this notebook changes; the raw files are not touched.
+
+# %%
+data["EXCLUDED"] = pd.read_csv(EXCLUDED_CSV)
+excluded_names = set(data["EXCLUDED"]["file"])
+
+# Catch typos: every excluded name must exist in the raw data
+unknown = excluded_names - {p.name for p in data["RAW_PICTURES"]}
+if unknown:
+    raise ValueError(f"Excluded files not found in the raw data: {sorted(unknown)}")
+
+data["PICTURES_BY_LABEL"] = {
+    label: [p for p in paths if p.name not in excluded_names]
+    for label, paths in data["PICTURES_BY_LABEL"].items()
+}
+print(len(excluded_names), "images excluded")
 {label: len(paths) for label, paths in data["PICTURES_BY_LABEL"].items()}
 
 # %%
