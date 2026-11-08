@@ -43,6 +43,14 @@ ROI_THRESHOLD = 0.8        # sharp area = at least 80 % of the sharpness in the 
 CROP_SIZE = 384            # px, side of one tile
 ROI = (256, 192, 1792, 1344)            # x0, y0, x1, y1 in px: 4 x 3 tiles of 384 px, centred
 ROI_FIRST_GUESS = (250, 200, 1750, 1400)  # x0, y0, x1, y1: first box chosen by eye (for comparison)
+TILE_EXAMPLES = [  # one image per label for the tile-grid figure
+    "A01_0001.png",  # good
+    "A01_0041.png",  # blur_light
+    "A01_0121.png",  # bubbles
+    "A01_0141.png",  # corner
+    "C01_0001.png",  # undiluted
+    "D01_0001.png",  # overdiluted
+]
 
 # Image number -> label for A preparations (CLAUDE.md §7.2): (last image number, label)
 LABELS_A = [
@@ -364,6 +372,40 @@ if fig_path.exists() and not OVERWRITE:
     print(f"Not saved, file exists (set OVERWRITE = True to replace): {fig_path}")
 else:
     fig.savefig(fig_path, dpi=200)
+    print("Saved", fig_path)
+plt.show()
+
+# %%
+# The ROI cut into tiles of CROP_SIZE px, drawn on the example images (TILE_EXAMPLES)
+by_name = {p.name: (label, p) for label, paths in data["PICTURES_BY_LABEL"].items() for p in paths}
+x0, y0, x1, y1 = ROI
+n_cols = (x1 - x0) // CROP_SIZE            # 4
+n_tiles = n_cols * ((y1 - y0) // CROP_SIZE)  # 12
+
+fig, axes = plt.subplots(2, 3, figsize=(21, 11), constrained_layout=True)
+for ax, name in zip(axes.flat, TILE_EXAMPLES):
+    label, path = by_name[name]
+    img = cv2.cvtColor(cv2.imread(str(path)), cv2.COLOR_BGR2RGB)[y0:y1, x0:x1]  # ROI only
+    ax.imshow(img, extent=(x0, x1, y1, y0))  # axes in px of the full frame
+    for x in range(x0, x1 + 1, CROP_SIZE):
+        ax.axvline(x, color="yellow", lw=2)
+    for y in range(y0, y1 + 1, CROP_SIZE):
+        ax.axhline(y, color="yellow", lw=2)
+    for k in range(n_tiles):
+        row, col = divmod(k, n_cols)  # tile number -> (row, column), e.g. 5 -> (1, 1)
+        ax.text(x0 + col * CROP_SIZE + 15, y0 + row * CROP_SIZE + 55, str(k),
+                color="yellow", fontsize=15, weight="bold")
+    ax.set_title(f"{label} ({name})", fontsize=14)
+    ax.set_xlabel("x [px]")
+    ax.set_ylabel("y [px]")
+fig.suptitle(f"ROI (x {x0}-{x1}, y {y0}-{y1}) cut into {n_tiles} tiles of {CROP_SIZE} x {CROP_SIZE} px",
+             fontsize=16)
+
+fig_path = RESULTS_DIR / "tiles_on_examples.png"
+if fig_path.exists() and not OVERWRITE:
+    print(f"Not saved, file exists (set OVERWRITE = True to replace): {fig_path}")
+else:
+    fig.savefig(fig_path, dpi=100)
     print("Saved", fig_path)
 plt.show()
 
