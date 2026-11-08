@@ -321,41 +321,41 @@ size distributions). Everything reproducible from config files with fixed seeds.
   (`[[tool.uv.index]]` + `[tool.uv.sources]`); after adding packages always re-check
   `torch.cuda.is_available()` (some packages can pull a CPU-only torch).
 - Stack: Python 3.11, PyTorch, timm, anomalib, opencv-python, scikit-image, scikit-learn, pandas,
-  numpy, matplotlib, grad-cam, statsmodels, pyyaml; dev: ipykernel, nbstripout.
+  numpy, matplotlib, grad-cam, statsmodels, pyyaml; dev: ipykernel, jupytext, nbstripout.
 - Project layout (repo root `~/mfg_qc`):
   ```
   mfg_qc/
     CLAUDE.md
     pyproject.toml  # uv project definition (+ uv.lock)
+    jupytext.toml   # formats = "ipynb,py:percent"
     .claude/        # settings.json with permission rules (maintained by the user)
-    notebooks/      # 00_inventory.ipynb, 01_roi.ipynb, ... (exploration, figures, results review)
-    src/            # reusable code imported by notebooks: inventory.py, roi.py, crops.py,
-                    # classical.py, anomaly.py, supervised.py, evaluate.py, rq4_sizes.py
+    notebooks/      # mfg_qc.ipynb + mfg_qc.py: the ONE project notebook (jupytext pair, py:percent)
     configs/        # YAML configs per experiment
-    scripts/        # CLI entry points for long runs (training, full evaluation)
     data/           # manifest.csv, crop cache (git-ignored)
     results/        # tables/figures; checkpoints and caches git-ignored
   ```
 - Development workflow [CONFIRMED user preference]:
-  - The user writes and runs code in **Jupyter notebooks (.ipynb) inside VS Code** (Microsoft
-    Python + Jupyter extensions). Kernel = the project's uv environment `~/mfg_qc/.venv`
-    (VS Code: Select Kernel → Python Environments → `.venv`). No JupyterLab server, no jupytext.
-  - Notebooks must show results inline: plots, pandas tables, example images, contact sheets.
+  - **Everything is done in ONE notebook**: `notebooks/mfg_qc.ipynb`, paired with
+    `notebooks/mfg_qc.py` in jupytext **py:percent** format (`jupytext.toml` at the repo root).
+    Do not create other notebooks.
+  - The user writes and runs it **inside VS Code** (Microsoft Python + Jupyter extensions).
+    Kernel = the project's uv environment `~/mfg_qc/.venv`
+    (VS Code: Select Kernel → Python Environments → `.venv`). No JupyterLab server.
+  - VS Code does not sync the pair automatically: after editing either file, run
+    `uv run jupytext --sync notebooks/mfg_qc.ipynb`.
+  - The notebook must show results inline: plots, pandas tables, example images, contact sheets.
     The user reviews everything visually in the notebook. Every figure/table meant for the paper is
     also saved to `results/`.
-  - Notebooks stay thin: logic lives in `src/` and is imported. First cell of every notebook:
-    `%load_ext autoreload`, `%autoreload 2`, and `sys.path` set to the repo root.
-  - Editing notebooks: prefer new notebooks or new cells; do not rewrite or delete existing cells and
-    never clear outputs. Never edit a notebook the user has open with unsaved changes — ask first.
-    Reusable logic goes into `src/*.py`.
-  - Long trainings run as scripts in `scripts/` (`uv run python scripts/...`) inside tmux, not in
-    notebook cells; notebooks then load the saved results.
+  - Editing the notebook: add new cells; do not rewrite or delete existing cells and never clear
+    outputs. Never edit the notebook while the user has it open with unsaved changes — ask first.
   - Git: nbstripout strips outputs only from committed notebooks (outputs stay in local files).
     Never commit images, crops, checkpoints or the raw dataset. Remote: private GitHub repository
     (made public at submission).
   - Commit small, logical steps with clear English messages, only when the user asks.
-- Raw folders are read-only. Ask before deleting or moving anything.
-- ASCII-only file and folder names; English code comments; log every run (config + git hash).
+  - Raw folders are read-only. Ask before deleting or moving anything.
+  - ASCII-only file and folder names; English code comments; log every run (config + git hash).
+
+
 
 ## 11. Key references (verify every DOI before citing)
 

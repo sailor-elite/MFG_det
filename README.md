@@ -31,18 +31,17 @@ uv run python -c "import torch; print(torch.cuda.is_available())"
 uv run nbstripout --install --attributes .gitattributes  # strip notebook outputs on commit
 ```
 
-Notebooks are run in VS Code with the project's `.venv` as the Jupyter kernel.
-Long training runs are started from `scripts/` with `uv run python scripts/<script>.py`.
+All code lives in one notebook, `notebooks/mfg_qc.ipynb`, run in VS Code with the project's `.venv`
+as the Jupyter kernel. It is paired with `notebooks/mfg_qc.py` (jupytext, py:percent); after editing
+either file, run `uv run jupytext --sync notebooks/mfg_qc.ipynb`.
 
 ## Repository layout
 
 ```
 configs/    YAML configs per experiment
 data/       manifest.csv (tracked); crop and feature caches (git-ignored)
-notebooks/  exploration, figures and results review (outputs stripped on commit)
+notebooks/  mfg_qc.ipynb + mfg_qc.py, the single project notebook (outputs stripped on commit)
 results/    metric tables and per-fold predictions; checkpoints and caches git-ignored
-scripts/    CLI entry points for long runs (training, full evaluation)
-src/        reusable code imported by notebooks and scripts
 ```
 
 ## Data
