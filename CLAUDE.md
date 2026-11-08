@@ -338,6 +338,10 @@ size distributions). Everything reproducible from config files with fixed seeds.
   - **Everything is done in ONE notebook**: `notebooks/mfg_qc.ipynb`, paired with
     `notebooks/mfg_qc.py` in jupytext **py:percent** format (`jupytext.toml` at the repo root).
     Do not create other notebooks.
+  - Notebook structure, top to bottom: `# Config` (imports first, then global variables)
+    → one `#` heading per pipeline step (Inventory, ROI, ...) → `# Experiments`
+    (temporary code only, at the bottom).
+
   - The user writes and runs it **inside VS Code** (Microsoft Python + Jupyter extensions).
     Kernel = the project's uv environment `~/mfg_qc/.venv`
     (VS Code: Select Kernel → Python Environments → `.venv`). No JupyterLab server.
