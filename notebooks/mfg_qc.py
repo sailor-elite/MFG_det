@@ -21,7 +21,9 @@
 import os
 import shutil
 import time
+from concurrent.futures import ProcessPoolExecutor
 from datetime import datetime
+from functools import partial
 from pathlib import Path
 
 import cv2
@@ -31,6 +33,7 @@ import pandas as pd
 from matplotlib.patches import Rectangle
 from skimage.feature import local_binary_pattern
 from skimage.filters import threshold_otsu
+from tqdm import tqdm
 
 # %%
 RAW_DIR = Path("/home/qq/Pictures/MFG_det")  # raw micrographs, READ ONLY
@@ -63,10 +66,20 @@ DATA_WORKERS = 4        # parallel loading processes assumed for training (CPU: 
 
 # Classical features (definitions in "# Classical methods")
 GLOBULE_BLUR_SIGMA = 15      # px, Gaussian blur that estimates the local background around globules
-GLOBULE_SAMPLE_TILES = 300   # random good tiles used to find the globule threshold (Otsu's method)
+GLOBULE_BLUR_SIGMA_WHOLE = GLOBULE_BLUR_SIGMA * WHOLE_SIZE[0] / (ROI[2] - ROI[0])  # 7.5 px: same in um
 FEATURE_EXAMPLE_TILE = 5     # tile shown for every label in the feature figures (centre left)
 SERIES_COLOUR = "#2a78d6"    # colour of the plotted label in comparison figures
 REFERENCE_COLOUR = "#52514e" # colour of the "good" reference in comparison figures
+FEATURES_DIR = Path("/home/qq/mfg_qc/data/features")      # feature tables (git-ignored)
+TILE_FEATURES_CSV = FEATURES_DIR / "tile_features.csv"    # 95 features of every tile (12 per image)
+WHOLE_FEATURES_CSV = FEATURES_DIR / "whole_features.csv"  # 95 features of every 768 x 576 whole picture
+HIST_TYPES = [  # histogram features: (column prefix, title, x-axis label, bin edges)
+    ("hist_bright", "brightness", "grey level", np.linspace(0, 256, 17)),
+    ("hist_hue", "hue (weighted by saturation)", "hue [deg]", np.linspace(0, 360, 19)),
+    ("hist_sat", "saturation", "saturation", np.linspace(0, 256, 17)),
+    ("hist_grad", "gradient magnitude", "log(1 + |grad I|)", np.linspace(0, 7.3, 17)),
+    ("hist_lbp", "LBP texture codes", "uniform LBP code", np.arange(11) - 0.5),
+]
 
 # Image number -> label for A preparations (CLAUDE.md §7.2): (last image number, label)
 LABELS_A = [
@@ -714,6 +727,132 @@ def tile_features(rgb: np.ndarray, globule_threshold: float, sigma: float) -> di
     }
 
 
+def deviation_counts(
+    path: Path, roi: tuple[int, int, int, int], tile: int, whole_size: tuple[int, int],
+    sigma_tile: float, sigma_whole: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return how often each value of D occurs in the tiles and in the whole picture of one image.
+
+    Used to find the globule thresholds with Otsu's method on all good images.
+
+    Args:
+        path (Path): image file, e.g. Path(".../A01_0001.png").
+        roi (tuple[int, int, int, int]): (x0, y0, x1, y1) of the ROI in px, e.g. ROI.
+        tile (int): tile side in px, e.g. 384.
+        whole_size (tuple[int, int]): whole-picture (width, height) in px, e.g. (768, 576).
+        sigma_tile, sigma_whole (float): background blur in px for tiles (15) and whole pictures (7.5).
+
+    Returns:
+        tuple[np.ndarray, np.ndarray]: counts of D in 256 bins of 1 grey level, summed over the
+            12 tiles, and for the whole picture; e.g. two arrays of shape (256,).
+    """
+    roi_img = load_roi(path, roi)
+    bins = dict(bins=256, range=(0, 256))
+    tile_counts = sum(
+        np.histogram(globule_deviation(cv2.cvtColor(t, cv2.COLOR_RGB2GRAY), sigma_tile), **bins)[0]
+        for t in cut_tiles(roi_img, tile)
+    )
+    whole_gray = cv2.cvtColor(shrink_roi(roi_img, whole_size), cv2.COLOR_RGB2GRAY)
+    whole_counts = np.histogram(globule_deviation(whole_gray, sigma_whole), **bins)[0]
+    return tile_counts, whole_counts
+
+
+def image_features(
+    path: Path, roi: tuple[int, int, int, int], tile: int, whole_size: tuple[int, int],
+    thresholds: tuple[float, float], sigmas: tuple[float, float],
+) -> tuple[list[dict[str, float]], dict[str, float]]:
+    """Return the 95 features of every tile of one image and of its whole picture.
+
+    Args:
+        path (Path): image file, e.g. Path(".../A01_0001.png").
+        roi (tuple[int, int, int, int]): (x0, y0, x1, y1) of the ROI in px, e.g. ROI.
+        tile (int): tile side in px, e.g. 384.
+        whole_size (tuple[int, int]): whole-picture (width, height) in px, e.g. (768, 576).
+        thresholds (tuple[float, float]): globule thresholds t for (tiles, whole picture).
+        sigmas (tuple[float, float]): background blur in px for (tiles, whole picture), e.g. (15, 7.5).
+
+    Returns:
+        tuple[list[dict[str, float]], dict[str, float]]: a list of 12 feature dicts (one per tile,
+            in tile_idx order) and one feature dict for the whole picture.
+    """
+    roi_img = load_roi(path, roi)
+    tiles = [tile_features(t, thresholds[0], sigmas[0]) for t in cut_tiles(roi_img, tile)]
+    whole = tile_features(shrink_roi(roi_img, whole_size), thresholds[1], sigmas[1])
+    return tiles, whole
+
+
+def run_parallel(func, items: list, workers: int, desc: str = "") -> list:
+    """Apply func to every item in parallel processes, keep the order, and show a tqdm progress bar.
+
+    Args:
+        func (callable): function of one argument, e.g. partial(image_features, roi=ROI, ...).
+        items (list): the arguments, e.g. a list of image paths.
+        workers (int): number of processes, e.g. DATA_WORKERS = 4.
+        desc (str): label of the progress bar, e.g. "features".
+
+    Returns:
+        list: func(item) for every item, in the same order as items.
+    """
+    with ProcessPoolExecutor(max_workers=workers) as pool:
+        return list(tqdm(pool.map(func, items, chunksize=4), total=len(items), desc=desc, unit="image"))
+
+
+def save_table(table: pd.DataFrame, path: Path, overwrite: bool) -> None:
+    """Save a table as CSV (numbers with 6 significant digits); never replace an existing file
+    unless overwrite is True.
+
+    Args:
+        table (pd.DataFrame): the table to save.
+        path (Path): output file, e.g. TILE_FEATURES_CSV.
+        overwrite (bool): True = replace an existing file (e.g. OVERWRITE).
+
+    Returns:
+        None. Prints whether the file was saved.
+    """
+    if path.exists() and not overwrite:
+        print(f"Not saved, file exists (set OVERWRITE = True to replace): {path}")
+    else:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        table.to_csv(path, index=False, float_format="%.6g")  # 6 significant digits
+        print(f"Saved {path} ({path.stat().st_size / 1e6:.1f} MB)")
+
+
+def plot_label_histograms(mean_hists: pd.DataFrame, title: str) -> plt.Figure:
+    """Plot the histogram features of every label (blue bars) against "good" (grey line).
+
+    Args:
+        mean_hists (pd.DataFrame): rows = histogram feature names (e.g. "hist_bright_00"),
+            columns = labels (must include "good"); e.g. the mean over all tiles of each label.
+        title (str): figure title.
+
+    Returns:
+        plt.Figure: one row per label, one column per histogram type in HIST_TYPES.
+    """
+    labels = list(mean_hists.columns)
+    fig, axes = plt.subplots(len(labels), len(HIST_TYPES), figsize=(20, 2.2 * len(labels)),
+                             constrained_layout=True, sharex="col")
+    for i, label in enumerate(labels):
+        for j, (prefix, hist_title, xlabel, edges) in enumerate(HIST_TYPES):
+            ax = axes[i, j]
+            rows = mean_hists.index.str.startswith(prefix)
+            values, reference = mean_hists.loc[rows, label].to_numpy(), mean_hists.loc[rows, "good"].to_numpy()
+            ax.bar((edges[:-1] + edges[1:]) / 2, values, width=0.85 * np.diff(edges),
+                   color=SERIES_COLOUR, label="this label")
+            ax.step(edges, np.r_[reference, reference[-1]], where="post", color=REFERENCE_COLOUR,
+                    lw=1.5, label="good (reference)")
+            ax.tick_params(labelsize=8)
+            ax.spines[["top", "right"]].set_visible(False)
+            if i == 0:
+                ax.set_title(hist_title, fontsize=11)
+            if i == len(labels) - 1:
+                ax.set_xlabel(xlabel)
+        axes[i, 0].set_ylabel(f"{label}\nshare of pixels", fontsize=9)
+    handles, legend_labels = axes[0, 0].get_legend_handles_labels()
+    fig.legend(handles, legend_labels, loc="upper right", ncol=2, frameon=False)
+    fig.suptitle(title, fontsize=13)
+    return fig
+
+
 # %% [markdown]
 # # Loading data
 
@@ -1211,20 +1350,23 @@ load_options.round(1)
 #
 # The features computed on one tile per label (tile `FEATURE_EXAMPLE_TILE` of the first image of
 # each label), to check them visually before computing them for all 47,592 tiles.
-# The globule threshold $t$ is found once with Otsu's method on `GLOBULE_SAMPLE_TILES` random good
-# tiles (like the ROI, which used all good images) and then used for every tile.
+# The globule threshold $t$ is found once with Otsu's method on all good tiles (like the ROI, which
+# used all good images) and then used for every tile; the whole pictures (half resolution) get
+# their own threshold, found the same way on all good whole pictures.
 
 # %%
-# Globule threshold t: Otsu's method on the pooled values of D from random good tiles
-rng = np.random.default_rng(SEED)
-good_tiles = data["TILES"][data["TILES"]["label"] == "good"]
-d_counts = np.zeros(256)
-for r in good_tiles.iloc[rng.choice(len(good_tiles), GLOBULE_SAMPLE_TILES, replace=False)].itertuples():
-    tile_gray = cv2.cvtColor(load_roi(Path(r.path), (r.x0, r.y0, r.x1, r.y1)), cv2.COLOR_RGB2GRAY)
-    d_counts += np.histogram(globule_deviation(tile_gray, GLOBULE_BLUR_SIGMA), bins=256, range=(0, 256))[0]
-data["GLOBULE_THRESHOLD"] = float(threshold_otsu(hist=(d_counts, np.arange(256) + 0.5)))
-print(f"Globule threshold t = {data['GLOBULE_THRESHOLD']:.1f} grey levels "
-      f"(from {GLOBULE_SAMPLE_TILES} good tiles)")
+# Globule thresholds t: Otsu's method on D of ALL good tiles, and separately of all good whole pictures
+good_paths = [Path(p) for p in data["TILES"].loc[data["TILES"]["label"] == "good", "path"].unique()]
+counts = run_parallel(
+    partial(deviation_counts, roi=ROI, tile=CROP_SIZE, whole_size=WHOLE_SIZE,
+            sigma_tile=GLOBULE_BLUR_SIGMA, sigma_whole=GLOBULE_BLUR_SIGMA_WHOLE),
+    good_paths, DATA_WORKERS, desc="D of good images",
+)
+bin_centres = np.arange(256) + 0.5
+data["GLOBULE_THRESHOLD"] = float(threshold_otsu(hist=(sum(c[0] for c in counts), bin_centres)))
+data["GLOBULE_THRESHOLD_WHOLE"] = float(threshold_otsu(hist=(sum(c[1] for c in counts), bin_centres)))
+print(f"Globule threshold t from {len(good_paths)} good images: tiles {data['GLOBULE_THRESHOLD']:.1f}, "
+      f"whole pictures {data['GLOBULE_THRESHOLD_WHOLE']:.1f} grey levels")
 
 # %%
 # One example tile per label and its features
@@ -1301,6 +1443,74 @@ fig.legend(handles, labels, loc="upper right", ncol=2, frameon=False)
 fig.suptitle(f"Histogram features of tile {FEATURE_EXAMPLE_TILE} of the first image of every label",
              fontsize=13)
 save_figure(fig, RESULTS_DIR / "histograms_example.png", OVERWRITE)
+plt.show()
+
+# %% [markdown]
+# ## Features of all images
+#
+# The 95 features for every tile (12 per image, full resolution) and for every whole picture
+# (the ROI scaled to 768 x 576 px), for all 3,966 images that are not excluded. Computed once in
+# `DATA_WORKERS` parallel processes (about 10-15 min) and saved to `data/features/`; later runs only
+# read the files (unless `OVERWRITE = True`).
+
+# %%
+if TILE_FEATURES_CSV.exists() and WHOLE_FEATURES_CSV.exists() and not OVERWRITE:
+    data["TILE_FEATURES"] = pd.read_csv(TILE_FEATURES_CSV)
+    data["WHOLE_FEATURES"] = pd.read_csv(WHOLE_FEATURES_CSV)
+    print("Loaded the saved feature tables")
+else:
+    images = data["TILES"].drop_duplicates("file")[["file", "path"]]
+    t0 = time.time()
+    results = run_parallel(
+        partial(image_features, roi=ROI, tile=CROP_SIZE, whole_size=WHOLE_SIZE,
+                thresholds=(data["GLOBULE_THRESHOLD"], data["GLOBULE_THRESHOLD_WHOLE"]),
+                sigmas=(GLOBULE_BLUR_SIGMA, GLOBULE_BLUR_SIGMA_WHOLE)),
+        [Path(p) for p in images["path"]], DATA_WORKERS, desc="features",
+    )
+    print(f"Computed in {(time.time() - t0) / 60:.1f} min")
+    data["TILE_FEATURES"] = pd.DataFrame([
+        {"file": file, "tile_idx": k, **features}
+        for file, (tile_list, _) in zip(images["file"], results)
+        for k, features in enumerate(tile_list)
+    ])
+    data["WHOLE_FEATURES"] = pd.DataFrame([
+        {"file": file, **whole} for file, (_, whole) in zip(images["file"], results)
+    ])
+    save_table(data["TILE_FEATURES"], TILE_FEATURES_CSV, OVERWRITE)
+    save_table(data["WHOLE_FEATURES"], WHOLE_FEATURES_CSV, OVERWRITE)
+print(f"Tiles: {data['TILE_FEATURES'].shape}, whole pictures: {data['WHOLE_FEATURES'].shape}")
+
+# %%
+# Median of every single-value feature per label, over all tiles and over all whole pictures
+label_of_file = data["TILES"].drop_duplicates("file").set_index("file")["label"]
+label_order = list(data["PICTURES_BY_LABEL"])  # good, blur_light, ..., frozen, uht
+single_features = [c for c in data["WHOLE_FEATURES"].columns if c != "file" and not c.startswith("hist_")]
+feature_medians = {
+    name: table.assign(label=table["file"].map(label_of_file))
+               .groupby("label")[single_features].median().T[label_order]
+    for name, table in [("tiles", data["TILE_FEATURES"]), ("whole pictures", data["WHOLE_FEATURES"])]
+}
+print("Median over all TILES of each label:")
+display(feature_medians["tiles"].round(3))
+print("Median over all WHOLE PICTURES (768 x 576) of each label:")
+feature_medians["whole pictures"].round(3)
+
+# %%
+# Average histograms per label over all tiles, compared with good
+hist_columns = [c for c in data["TILE_FEATURES"].columns if c.startswith("hist_")]
+mean_hists_tiles = (data["TILE_FEATURES"].assign(label=data["TILE_FEATURES"]["file"].map(label_of_file))
+                    .groupby("label")[hist_columns].mean().T[label_order])
+fig = plot_label_histograms(mean_hists_tiles, "Average histograms over all TILES of every label (384 x 384 px)")
+save_figure(fig, RESULTS_DIR / "histograms_all_tiles.png", OVERWRITE)
+plt.show()
+
+# %%
+# Average histograms per label over all whole pictures, compared with good
+mean_hists_whole = (data["WHOLE_FEATURES"].assign(label=data["WHOLE_FEATURES"]["file"].map(label_of_file))
+                    .groupby("label")[hist_columns].mean().T[label_order])
+fig = plot_label_histograms(mean_hists_whole,
+                            "Average histograms over all WHOLE PICTURES of every label (768 x 576 px)")
+save_figure(fig, RESULTS_DIR / "histograms_all_whole.png", OVERWRITE)
 plt.show()
 
 # %% [markdown]

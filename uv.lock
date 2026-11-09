@@ -2466,6 +2466,7 @@ dependencies = [
     { name = "timm" },
     { name = "torch" },
     { name = "torchvision" },
+    { name = "tqdm" },
 ]
 
 [package.dev-dependencies]
@@ -2493,6 +2494,7 @@ requires-dist = [
     { name = "timm", specifier = ">=1.0.31" },
     { name = "torch", specifier = ">=2.14.1", index = "https://download.pytorch.org/whl/cu126" },
     { name = "torchvision", specifier = ">=0.29.1", index = "https://download.pytorch.org/whl/cu126" },
+    { name = "tqdm", specifier = ">=4.70.1" },
 ]
 
 [package.metadata.requires-dev]
