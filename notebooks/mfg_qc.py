@@ -342,6 +342,49 @@ def sharp_extent(profile: np.ndarray, threshold: float, cell: int) -> tuple[int,
     return int(sharp[0] * cell), int((sharp[-1] + 1) * cell)
 
 
+def build_tile_table(manifest: pd.DataFrame, roi: tuple[int, int, int, int], tile: int) -> pd.DataFrame:
+    """Return one row per tile: every image that is not excluded, cut into a grid of tiles in the ROI.
+
+    Args:
+        manifest (pd.DataFrame): the manifest (one row per raw image), e.g. read from MANIFEST_CSV.
+            Needs the columns file, path, prep_id, label, label_group, is_defect, fold,
+            test_only and excluded.
+        roi (tuple[int, int, int, int]): (x0, y0, x1, y1) of the ROI in px, e.g. (256, 192, 1792, 1344).
+        tile (int): side of one square tile in px, e.g. 384. Must divide the ROI width and height.
+
+    Returns:
+        pd.DataFrame: one row per tile (images x tiles, e.g. 3966 x 12 = 47592 rows) with the image
+            columns file, path, prep_id, label, label_group, is_defect, fold, test_only, plus
+            tile_idx (int): 0-11, row by row from the top left,
+            tile_row, tile_col (int): position in the grid, e.g. tile 5 -> row 1, column 1,
+            x0, y0, x1, y1 (int): tile corners in px of the full frame, e.g. 640, 576, 1024, 960.
+
+    Raises:
+        ValueError: if the tile size does not divide the ROI size.
+    """
+    rx0, ry0, rx1, ry1 = roi
+    if (rx1 - rx0) % tile or (ry1 - ry0) % tile:
+        raise ValueError(f"Tile size {tile} does not divide the ROI {rx1 - rx0} x {ry1 - ry0}")
+    n_cols, n_rows = (rx1 - rx0) // tile, (ry1 - ry0) // tile  # 4, 3
+
+    grid = pd.DataFrame([
+        {
+            "tile_idx": row * n_cols + col,
+            "tile_row": row,
+            "tile_col": col,
+            "x0": rx0 + col * tile,
+            "y0": ry0 + row * tile,
+            "x1": rx0 + (col + 1) * tile,
+            "y1": ry0 + (row + 1) * tile,
+        }
+        for row in range(n_rows)
+        for col in range(n_cols)
+    ])
+    image_columns = ["file", "path", "prep_id", "label", "label_group", "is_defect", "fold", "test_only"]
+    images = manifest.loc[~manifest["excluded"], image_columns]
+    return images.merge(grid, how="cross")  # every image x every tile
+
+
 # %% [markdown]
 # # Loading data
 
@@ -573,6 +616,31 @@ else:
     fig.savefig(fig_path, dpi=100)
     print("Saved", fig_path)
 plt.show()
+
+# %% [markdown]
+# # Model data
+#
+# What the models get (CLAUDE.md §9 Step 2), for every image that is not excluded:
+# - the ROI cut into 12 tiles of 384 x 384 px (tile models, anomaly detection),
+# - the whole ROI (1536 x 1152 px) scaled to 768 x 576 px (whole-picture model).
+
+# %% [markdown]
+# ## Tile table
+#
+# One row per tile, built from `data/manifest.csv`: labels, folds, `test_only` and the excluded flag
+# come from there (excluded images get no tiles). `x0, y0, x1, y1` are in px of the full frame.
+
+# %%
+manifest = pd.read_csv(MANIFEST_CSV, dtype={"fold": "Int64"})
+data["TILES"] = build_tile_table(manifest, ROI, CROP_SIZE)
+print(f"{len(data['TILES'])} tiles from {data['TILES']['file'].nunique()} images")
+data["TILES"].head(12)  # the 12 tiles of the first image
+
+# %%
+# Check: tiles per label and fold (= 12 x the images used per label and fold in the manifest check)
+data["TILES"].assign(
+    fold_name=lambda d: ("fold " + d["fold"].astype("string")).fillna("test only")
+).pivot_table(index="label", columns="fold_name", values="file", aggfunc="size", fill_value=0)
 
 # %% [markdown]
 # # Experiments
