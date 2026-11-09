@@ -257,7 +257,7 @@ Write `data/manifest.csv` with columns:
 `path, prep_id, prep_type, image_idx, label, label_group, is_defect, dilution_ml, day, milk_type,
 prep_time, photo_time, fold`. Print a summary table and stop for user review if counts differ.
 
-**Step 1 — Useful ROI.** On all good images (after exclusions) good images, compute a tile-wise sharpness map (variance of
+**Step 1 — Useful ROI.** On all good images (after exclusions), compute a tile-wise sharpness map (variance of
 Laplacian per tile), average it, and choose the central region where sharpness ≥ 80% of the centre.
 Save the figure (it goes into the paper). Use the same ROI for every image of every class.
 
