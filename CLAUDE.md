@@ -73,9 +73,10 @@ Output: a journal article (pilot / feasibility study) plus reproducible code and
 - **RQ1** Which method family (classical / unsupervised anomaly detection / supervised CNN) best
   separates good from defective images, and best recognizes the defect type?
 - **RQ2** How does detection depend on defect severity (light vs. heavy defocus)?
-- **RQ3** Do detectors confuse a different milk type with an image defect? (false alarms on good
-  images of frozen milk and UHT milk)
-- **RQ4** How do defective images bias downstream analysis (e.g. fat-globule size distribution)?
+- **RQ3** Do detectors flag images of a different milk type (frozen, UHT)? They look clearly
+  different from fresh milk and count as images to be flagged.
+
+
 
 Formulate results as answers ("which / how much"), not as hypotheses that must be confirmed.
 Report all methods and all classes, including where methods fail.
@@ -234,7 +235,8 @@ collected. Removed categories (not in the data): oil-contaminated optics, low co
 - **T2**: multi-class defect type (10 fine labels in §7.2; also report the coarse groups
   acquisition / preparation / field position).
 - **T3**: severity analysis for blur (light vs. heavy) — detection rate per level.
-- Test-only sets F and U contain only good images → report false-alarm rate (1 − specificity).
+- Test-only sets F and U (frozen, UHT milk) count as "to be flagged" → report the detection rate.
+
 
 ## 9. Analysis pipeline (implement in this order)
 
@@ -255,7 +257,7 @@ Write `data/manifest.csv` with columns:
 `path, prep_id, prep_type, image_idx, label, label_group, is_defect, dilution_ml, day, milk_type,
 prep_time, photo_time, fold`. Print a summary table and stop for user review if counts differ.
 
-**Step 1 — Useful ROI.** On ~20–30 good images, compute a tile-wise sharpness map (variance of
+**Step 1 — Useful ROI.** On all good images (after exclusions) good images, compute a tile-wise sharpness map (variance of
 Laplacian per tile), average it, and choose the central region where sharpness ≥ 80% of the centre.
 Save the figure (it goes into the paper). Use the same ROI for every image of every class.
 
@@ -266,15 +268,16 @@ source paper.
 
 **Step 3 — Classical baselines (CPU).** Features: variance of Laplacian, Tenengrad, Brenner,
 image entropy, mean/std intensity, RMS contrast, colour statistics (mean RGB/HSV, channel ratios),
-globule area fraction (threshold segmentation). Two modes: (a) one-class thresholds = 95th
-percentile of good validation scores; (b) supervised logistic regression / random forest.
+globule area fraction (threshold segmentation), histograms (brightness, hue/saturation, gradient
+magnitude, optionally LBP texture). Three modes: (a) one-class thresholds = 95th percentile of good
+validation scores; (b) supervised logistic regression / random forest; (c) one-class models on the
+feature vector (Mahalanobis, One-Class SVM, Isolation Forest).
 
-**Step 4 — Unsupervised anomaly detection.** Anomalib PatchCore (backbone wide_resnet50_2, fall back
-to resnet18 if memory is short; coreset ratio ~0.01) and PaDiM (resnet18). Train on good images
-only; image-level score; threshold from good-only validation percentile; save anomaly maps.
-Note: PaDiM models per-position statistics (designed for aligned objects); our images are
-stationary textures — comment on this in the discussion. Check the installed Anomalib version and
-its docs before writing code (API differs between major versions).
+**Step 4 — Unsupervised anomaly detection.** Anomalib PatchCore (backbone wide_resnet50_2, fall back to resnet18 if memory is short; coreset
+ratio ~0.01), PaDiM (resnet18; test whether per-position statistics suit our textures),
+EfficientAD, DFM; optionally Dinomaly or AnomalyDINO if it fits 4 GB. Train on good images only; image-level score; threshold from good-only validation percentile;
+save anomaly maps. Check the installed Anomalib version and its docs before writing code
+(API differs between major versions).
 
 **Step 5 — Supervised CNNs.** timm ResNet-18/50 and Xception, ImageNet-pretrained, crop inputs,
 class weights for imbalance, mixed precision (fall back to FP32 if NaNs), gradient accumulation to
@@ -295,16 +298,13 @@ dilution level and day):
 - F and U are never used for training; evaluate every fold model on them (mean ± SD).
 - Metrics: AUROC, balanced accuracy, HAR, per-class recall, false-positive rate on good,
   confusion matrices; 95% CIs by cluster bootstrap over preparations; McNemar test for paired
-  method comparisons; detection rate per blur level (RQ2); false-alarm rate on F/U (RQ3);
+  method comparisons; detection rate per blur level (RQ2); detection rate on F/U (RQ3);
   inference time per image on CPU and GPU.
-- RQ4: segment globules (e.g. Hough circles or threshold + watershed) on good vs. defective images
-  of the same preparations; compare size distributions (Wasserstein distance, KS test).
 - Sanity check first: mean-colour features must separate filter_yellow/filter_blue from good almost
   perfectly. If not, suspect a label/order bug, not the method.
 
 **Step 7 — Outputs.** `results/` with per-fold predictions (CSV), metric tables, figures
-(ROI map, example images per class, anomaly maps, Grad-CAM, confusion matrices, severity curve,
-size distributions). Everything reproducible from config files with fixed seeds.
+(ROI map, example images per class, anomaly maps, Grad-CAM, confusion matrices, severity curve). Everything reproducible from config files with fixed seeds.
 
 ## 10. Compute and engineering conventions
 

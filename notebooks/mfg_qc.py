@@ -404,6 +404,13 @@ for ax, (label, paths) in zip(axes.flat, data["PICTURES_BY_LABEL"].items()):
     ax.set_title(f"{label}  ({paths[0].name})")
     ax.set_xlabel("x [px]")
     ax.set_ylabel("y [px]")
+
+fig_path = RESULTS_DIR / "example_images.png"
+if fig_path.exists() and not OVERWRITE:
+    print(f"Not saved, file exists (set OVERWRITE = True to replace): {fig_path}")
+else:
+    fig.savefig(fig_path, dpi=100)
+    print("Saved", fig_path)
 plt.show()
 
 # %% [markdown]
