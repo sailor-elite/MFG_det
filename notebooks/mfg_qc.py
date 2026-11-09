@@ -47,6 +47,13 @@ ROI_FIRST_GUESS = (250, 200, 1750, 1400)  # x0, y0, x1, y1: first box chosen by 
 WHOLE_SIZE = (768, 576)    # (width, height) in px of the whole-picture input: the ROI scaled to half
 EXAMPLE_IMAGE = "A01_0141.png"  # corner image used to show what the models get
 
+# Augmentation (training only): exact flips and rotations by multiples of 90 deg, no interpolation.
+# One version = (number of 90 deg counter-clockwise rotations, horizontal flip after rotating).
+AUG_TILE = [(k, flip) for flip in (False, True) for k in range(4)]  # all 8 versions of a square tile
+AUG_WHOLE = [(0, False), (0, True), (2, True), (2, False)]  # original, h-flip, v-flip, 180 deg:
+                                                             # the 4 versions that keep 768 x 576
+AUG_EXAMPLE_TILE = 10  # tile of EXAMPLE_IMAGE shown in the augmentation figure (edge of the coverslip)
+
 # Image number -> label for A preparations (CLAUDE.md §7.2): (last image number, label)
 LABELS_A = [
     (40, "good"),
@@ -441,6 +448,50 @@ def shrink_roi(roi_img: np.ndarray, size: tuple[int, int]) -> np.ndarray:
     return cv2.resize(roi_img, size, interpolation=cv2.INTER_AREA)
 
 
+def augment(img: np.ndarray, k_rot: int, flip: bool) -> np.ndarray:
+    """Return one augmented version of an image: rotation by k_rot x 90 deg, then an optional flip.
+
+    Both operations only move pixels (no interpolation), so the pixel values stay exactly the same.
+
+    Args:
+        img (np.ndarray): image of shape (height, width, 3), e.g. a tile (384, 384, 3).
+        k_rot (int): number of 90 deg counter-clockwise rotations, 0-3.
+        flip (bool): True = flip left-right after rotating.
+            (k_rot=0, flip=True) = horizontal flip; (k_rot=2, flip=True) = vertical flip.
+
+    Returns:
+        np.ndarray: the augmented image; shape (height, width, 3) for k_rot 0 or 2,
+            (width, height, 3) for k_rot 1 or 3.
+
+    Raises:
+        ValueError: if k_rot is not 0, 1, 2 or 3.
+    """
+    if k_rot not in (0, 1, 2, 3):
+        raise ValueError(f"k_rot must be 0-3, got {k_rot}")
+    out = np.rot90(img, k=k_rot, axes=(0, 1))
+    if flip:
+        out = out[:, ::-1]
+    return np.ascontiguousarray(out)
+
+
+def augment_name(k_rot: int, flip: bool) -> str:
+    """Return a readable name of an augmented version, e.g. (1, True) -> "rot 90 + h-flip".
+
+    Args:
+        k_rot (int): number of 90 deg counter-clockwise rotations, 0-3.
+        flip (bool): True = flip left-right after rotating.
+
+    Returns:
+        str: e.g. "original", "rot 180", "h-flip", "v-flip", "rot 90 + h-flip".
+    """
+    if (k_rot, flip) == (0, False):
+        return "original"
+    if (k_rot, flip) == (2, True):
+        return "v-flip"  # 180 deg rotation + h-flip = vertical flip
+    rot = f"rot {90 * k_rot}" if k_rot else ""
+    return " + ".join(part for part in (rot, "h-flip" if flip else "") if part)
+
+
 # %% [markdown]
 # # Loading data
 
@@ -738,6 +789,59 @@ fig_whole.suptitle(f"Whole ROI scaled to {WHOLE_SIZE[0]} x {WHOLE_SIZE[1]} px (h
 fig.suptitle(f"What the models get from {EXAMPLE_IMAGE} ({example_rows['label'].iloc[0]})", fontsize=15)
 
 fig_path = RESULTS_DIR / "model_inputs_example.png"
+if fig_path.exists() and not OVERWRITE:
+    print(f"Not saved, file exists (set OVERWRITE = True to replace): {fig_path}")
+else:
+    fig.savefig(fig_path, dpi=100)
+    print("Saved", fig_path)
+plt.show()
+
+# %% [markdown]
+# ## Augmentation
+#
+# Used only when training (never on validation or test data): flips and rotations by 90, 180 and
+# 270 deg. They only move pixels, so no detail is blurred and no colour changes; the label stays true.
+# A tile has 8 versions (`AUG_TILE`); the 768 x 576 whole picture has 4 (`AUG_WHOLE`), because a
+# 90 deg rotation would turn it into 576 x 768.
+
+# %%
+aug_tile = tiles[AUG_EXAMPLE_TILE]  # tiles and whole of EXAMPLE_IMAGE, from the cell above
+tile_versions = [augment(aug_tile, k, flip) for k, flip in AUG_TILE]
+whole_versions = [augment(whole, k, flip) for k, flip in AUG_WHOLE]
+
+# Check: every version has exactly the same pixel values (only their positions change),
+# and all versions are different from each other
+same_pixels = all(
+    np.array_equal(np.sort(v, axis=None), np.sort(orig, axis=None))
+    for orig, versions in [(aug_tile, tile_versions), (whole, whole_versions)]
+    for v in versions
+)
+n_distinct = len({v.tobytes() for v in tile_versions}), len({v.tobytes() for v in whole_versions})
+print("Tile versions:", [v.shape for v in tile_versions][0], "x", len(tile_versions),
+      "| whole versions:", [v.shape for v in whole_versions][0], "x", len(whole_versions))
+print("Same pixel values in every version:", same_pixels)
+print(f"Distinct versions: tile {n_distinct[0]} of 8, whole {n_distinct[1]} of 4")
+
+# %%
+fig = plt.figure(figsize=(24, 9), constrained_layout=True)
+fig_t, fig_w = fig.subfigures(1, 2, width_ratios=[1, 1.1])
+
+# Left: the 8 versions of one tile
+for ax, (k, flip), v in zip(fig_t.subplots(2, 4).flat, AUG_TILE, tile_versions):
+    ax.imshow(v)
+    ax.set_title(augment_name(k, flip), fontsize=12)
+    ax.tick_params(labelsize=7)
+fig_t.suptitle(f"Tile {AUG_EXAMPLE_TILE}: 8 versions ({CROP_SIZE} x {CROP_SIZE} px)")
+
+# Right: the 4 versions of the whole picture
+for ax, (k, flip), v in zip(fig_w.subplots(2, 2).flat, AUG_WHOLE, whole_versions):
+    ax.imshow(v)
+    ax.set_title(augment_name(k, flip), fontsize=12)
+    ax.tick_params(labelsize=7)
+fig_w.suptitle(f"Whole picture: 4 versions ({WHOLE_SIZE[0]} x {WHOLE_SIZE[1]} px)")
+fig.suptitle(f"Augmentation of {EXAMPLE_IMAGE} ({example_rows['label'].iloc[0]})", fontsize=15)
+
+fig_path = RESULTS_DIR / "augmentation_example.png"
 if fig_path.exists() and not OVERWRITE:
     print(f"Not saved, file exists (set OVERWRITE = True to replace): {fig_path}")
 else:
