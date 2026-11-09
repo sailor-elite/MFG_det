@@ -853,6 +853,52 @@ def plot_label_histograms(mean_hists: pd.DataFrame, title: str) -> plt.Figure:
     return fig
 
 
+def plot_feature_boxplots(
+    table: pd.DataFrame, label_of_file: pd.Series, features: list[str], label_order: list[str],
+    title: str, log_features: tuple[str, ...] = ("vol", "tenengrad", "brenner"),
+) -> plt.Figure:
+    """Plot one small box plot per feature: the spread of the feature for every label.
+
+    Box = 25th-75th percentile, line = median, whiskers = 5th-95th percentile (single extreme
+    values are not drawn). "good" is grey, with a dashed line at its median for comparison.
+
+    Args:
+        table (pd.DataFrame): one row per tile or whole picture, with a "file" column and the
+            feature columns, e.g. data["TILE_FEATURES"].
+        label_of_file (pd.Series): file name -> label, e.g. "A01_0001.png" -> "good".
+        features (list[str]): the features to plot, e.g. the 19 single-value features.
+        label_order (list[str]): labels from left to right, e.g. ["good", "blur_light", ...].
+        title (str): figure title.
+        log_features (tuple[str, ...]): features drawn on a log scale (they span orders of magnitude).
+
+    Returns:
+        plt.Figure: a grid of 4 columns with one panel per feature.
+    """
+    labels = table["file"].map(label_of_file)
+    n_cols = 4
+    n_rows = -(-len(features) // n_cols)  # round up, e.g. 19 features -> 5 rows
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(20, 4.4 * n_rows), constrained_layout=True)
+    for ax, feature in zip(axes.flat, features):
+        values = [table.loc[labels == label, feature].to_numpy() for label in label_order]
+        boxes = ax.boxplot(values, whis=(5, 95), showfliers=False, patch_artist=True, widths=0.6,
+                           medianprops=dict(color="white", lw=1.5))
+        for box, label in zip(boxes["boxes"], label_order):
+            colour = REFERENCE_COLOUR if label == "good" else SERIES_COLOUR
+            box.set(facecolor=colour, edgecolor=colour)
+        ax.axhline(np.median(values[label_order.index("good")]), color=REFERENCE_COLOUR, lw=1, ls="--")
+        if feature in log_features:
+            ax.set_yscale("log")
+        ax.set_title(feature, fontsize=11)
+        ax.set_xticks(range(1, len(label_order) + 1), label_order, rotation=90, fontsize=8)
+        ax.tick_params(axis="y", labelsize=8)
+        ax.spines[["top", "right"]].set_visible(False)
+    for ax in axes.flat[len(features):]:  # empty panels at the end
+        ax.set_visible(False)
+    fig.suptitle(f"{title}\nbox = 25-75 %, line = median, whiskers = 5-95 %; "
+                 "grey = good, dashed line = median of good", fontsize=13)
+    return fig
+
+
 # %% [markdown]
 # # Loading data
 
@@ -1494,6 +1540,20 @@ print("Median over all TILES of each label:")
 display(feature_medians["tiles"].round(3))
 print("Median over all WHOLE PICTURES (768 x 576) of each label:")
 feature_medians["whole pictures"].round(3)
+
+# %%
+# Box plots of the 19 single-value features per label, over all tiles
+fig = plot_feature_boxplots(data["TILE_FEATURES"], label_of_file, single_features, label_order,
+                            "Single-value features over all TILES of every label (384 x 384 px)")
+save_figure(fig, RESULTS_DIR / "boxplots_all_tiles.png", OVERWRITE)
+plt.show()
+
+# %%
+# Box plots of the 19 single-value features per label, over all whole pictures
+fig = plot_feature_boxplots(data["WHOLE_FEATURES"], label_of_file, single_features, label_order,
+                            "Single-value features over all WHOLE PICTURES of every label (768 x 576 px)")
+save_figure(fig, RESULTS_DIR / "boxplots_all_whole.png", OVERWRITE)
+plt.show()
 
 # %%
 # Average histograms per label over all tiles, compared with good
