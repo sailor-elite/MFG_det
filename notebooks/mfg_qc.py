@@ -20,6 +20,7 @@
 # %%
 import os
 import shutil
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -53,6 +54,10 @@ AUG_TILE = [(k, flip) for flip in (False, True) for k in range(4)]  # all 8 vers
 AUG_WHOLE = [(0, False), (0, True), (2, True), (2, False)]  # original, h-flip, v-flip, 180 deg:
                                                              # the 4 versions that keep 768 x 576
 AUG_EXAMPLE_TILE = 10  # tile of EXAMPLE_IMAGE shown in the augmentation figure (edge of the coverslip)
+
+# Speed test of loading the model inputs
+SPEED_TEST_IMAGES = 40  # random images (not excluded) that are timed
+DATA_WORKERS = 4        # parallel loading processes assumed for training (CPU: 4 cores, 8 threads)
 
 # Image number -> label for A preparations (CLAUDE.md §7.2): (last image number, label)
 LABELS_A = [
@@ -492,6 +497,57 @@ def augment_name(k_rot: int, flip: bool) -> str:
     return " + ".join(part for part in (rot, "h-flip" if flip else "") if part)
 
 
+def measure_load_times(
+    paths: list[Path], roi: tuple[int, int, int, int], tile: int, size: tuple[int, int]
+) -> pd.DataFrame:
+    """Time, for each image, every step of making the model inputs (one CPU core).
+
+    Reading a cache is simulated by encoding the small images as PNG in memory and timing only the
+    decoding, so nothing is written to disk.
+
+    Args:
+        paths (list[Path]): image files to time, e.g. 40 random raw images.
+        roi (tuple[int, int, int, int]): (x0, y0, x1, y1) of the ROI in px, e.g. ROI.
+        tile (int): tile side in px, e.g. 384.
+        size (tuple[int, int]): whole-picture (width, height) in px, e.g. (768, 576).
+
+    Returns:
+        pd.DataFrame: one row per image, times in ms, with columns
+            read_roi: read the 2048 x 1536 PNG from disk and cut the ROI (load_roi),
+            cut_tiles: cut the ROI into tiles (cut_tiles),
+            shrink: scale the ROI to the whole-picture size (shrink_roi),
+            decode_whole_png: decode a cached whole picture (768 x 576 PNG),
+            decode_tile_pngs: decode all cached tiles of one image (e.g. 12 PNGs of 384 x 384).
+    """
+    rows = []
+    for path in paths:
+        t0 = time.perf_counter()
+        roi_img = load_roi(path, roi)
+        t1 = time.perf_counter()
+        tiles = cut_tiles(roi_img, tile)
+        t2 = time.perf_counter()
+        whole = shrink_roi(roi_img, size)
+        t3 = time.perf_counter()
+
+        whole_png = cv2.imencode(".png", whole)[1]                   # cached file, in memory
+        tile_pngs = [cv2.imencode(".png", t)[1] for t in tiles]
+        t4 = time.perf_counter()
+        cv2.imdecode(whole_png, cv2.IMREAD_COLOR)
+        t5 = time.perf_counter()
+        for png in tile_pngs:
+            cv2.imdecode(png, cv2.IMREAD_COLOR)
+        t6 = time.perf_counter()
+
+        rows.append({
+            "read_roi": (t1 - t0) * 1000,
+            "cut_tiles": (t2 - t1) * 1000,
+            "shrink": (t3 - t2) * 1000,
+            "decode_whole_png": (t5 - t4) * 1000,
+            "decode_tile_pngs": (t6 - t5) * 1000,
+        })
+    return pd.DataFrame(rows)
+
+
 # %% [markdown]
 # # Loading data
 
@@ -848,6 +904,47 @@ else:
     fig.savefig(fig_path, dpi=100)
     print("Saved", fig_path)
 plt.show()
+
+# %% [markdown]
+# ## Speed test
+#
+# How long it takes to make the model inputs, to decide whether a cache on disk is needed.
+# Timed on `SPEED_TEST_IMAGES` random images (one CPU core). Reading a file the first time is slower
+# than reading it again (the operating system keeps recently read files in RAM), so repeated runs
+# can be faster.
+
+# %%
+rng = np.random.default_rng(SEED)
+images_used = data["TILES"].drop_duplicates("file")  # one row per image that is not excluded
+speed_sample = images_used.iloc[sorted(rng.choice(len(images_used), SPEED_TEST_IMAGES, replace=False))]
+load_times = measure_load_times([Path(p) for p in speed_sample["path"]], ROI, CROP_SIZE, WHOLE_SIZE)
+load_times.agg(["mean", "median", "max"]).T.round(1).rename_axis("ms per image")
+
+# %%
+# What this means for one pass over all images (e.g. one training epoch)
+ms = load_times.mean()
+n_images = len(images_used)  # 3966
+load_options = pd.DataFrame(
+    {
+        "ms per image": [
+            ms["read_roi"] + ms["cut_tiles"],  # 12 tiles, cut from the full PNG each time
+            ms["read_roi"] + ms["shrink"],      # whole picture, scaled from the full PNG each time
+            ms["decode_tile_pngs"],             # 12 tiles read from a tile cache
+            ms["decode_whole_png"],             # whole picture read from a 768 x 576 cache
+        ],
+        "cache on disk": ["none", "none", "about 21 GB", "about 1-1.5 GB"],
+    },
+    index=[
+        "12 tiles, on the fly",
+        "whole picture, on the fly",
+        "12 tiles, from cache",
+        "whole picture, from cache",
+    ],
+)
+load_options["images/s (1 core)"] = 1000 / load_options["ms per image"]
+load_options[f"images/s ({DATA_WORKERS} workers)"] = load_options["images/s (1 core)"] * DATA_WORKERS
+load_options[f"1 pass, {DATA_WORKERS} workers [s]"] = n_images / load_options[f"images/s ({DATA_WORKERS} workers)"]
+load_options.round(1)
 
 # %% [markdown]
 # # Experiments
