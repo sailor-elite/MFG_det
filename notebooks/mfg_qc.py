@@ -29,6 +29,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from matplotlib.patches import Rectangle
+from skimage.feature import local_binary_pattern
+from skimage.filters import threshold_otsu
 
 # %%
 RAW_DIR = Path("/home/qq/Pictures/MFG_det")  # raw micrographs, READ ONLY
@@ -58,6 +60,13 @@ AUG_EXAMPLE_TILE = 10  # tile of EXAMPLE_IMAGE shown in the augmentation figure 
 # Speed test of loading the model inputs
 SPEED_TEST_IMAGES = 40  # random images (not excluded) that are timed
 DATA_WORKERS = 4        # parallel loading processes assumed for training (CPU: 4 cores, 8 threads)
+
+# Classical features (definitions in "# Classical methods")
+GLOBULE_BLUR_SIGMA = 15      # px, Gaussian blur that estimates the local background around globules
+GLOBULE_SAMPLE_TILES = 300   # random good tiles used to find the globule threshold (Otsu's method)
+FEATURE_EXAMPLE_TILE = 5     # tile shown for every label in the feature figures (centre left)
+SERIES_COLOUR = "#2a78d6"    # colour of the plotted label in comparison figures
+REFERENCE_COLOUR = "#52514e" # colour of the "good" reference in comparison figures
 
 # Image number -> label for A preparations (CLAUDE.md §7.2): (last image number, label)
 LABELS_A = [
@@ -546,6 +555,163 @@ def measure_load_times(
             "decode_tile_pngs": (t6 - t5) * 1000,
         })
     return pd.DataFrame(rows)
+
+
+def save_figure(fig: plt.Figure, path: Path, overwrite: bool, dpi: int = 100) -> None:
+    """Save a figure, but never replace an existing file unless overwrite is True.
+
+    Args:
+        fig (plt.Figure): the figure to save.
+        path (Path): output file, e.g. RESULTS_DIR / "histograms_example.png".
+        overwrite (bool): True = replace an existing file (e.g. OVERWRITE).
+        dpi (int): resolution of the saved file, e.g. 100.
+
+    Returns:
+        None. Prints whether the file was saved.
+    """
+    if path.exists() and not overwrite:
+        print(f"Not saved, file exists (set OVERWRITE = True to replace): {path}")
+    else:
+        fig.savefig(path, dpi=dpi)
+        print("Saved", path)
+
+
+def focus_features(gray: np.ndarray) -> dict[str, float]:
+    """Return the focus (sharpness) measures of a grey tile: VoL, Tenengrad, Brenner.
+
+    Args:
+        gray (np.ndarray): grey tile, uint8, shape (384, 384).
+
+    Returns:
+        dict[str, float]: {"vol": ..., "tenengrad": ..., "brenner": ...}; all drop when blurred.
+    """
+    g = gray.astype(np.float64)
+    laplacian = cv2.Laplacian(g, cv2.CV_64F)       # kernel [[0, 1, 0], [1, -4, 1], [0, 1, 0]]
+    gx = cv2.Sobel(g, cv2.CV_64F, 1, 0, ksize=3)   # I_x
+    gy = cv2.Sobel(g, cv2.CV_64F, 0, 1, ksize=3)   # I_y
+    dx = g[:, 2:] - g[:, :-2]                      # I(x+2, y) - I(x, y)
+    dy = g[2:, :] - g[:-2, :]                      # I(x, y+2) - I(x, y)
+    return {
+        "vol": float(laplacian.var()),
+        "tenengrad": float(np.mean(gx**2 + gy**2)),
+        "brenner": float((np.sum(dx**2) + np.sum(dy**2)) / g.size),
+    }
+
+
+def grey_features(gray: np.ndarray) -> dict[str, float]:
+    """Return entropy, mean, standard deviation and RMS contrast of a grey tile.
+
+    Args:
+        gray (np.ndarray): grey tile, uint8, shape (384, 384).
+
+    Returns:
+        dict[str, float]: {"entropy": bits, "mean": mu, "std": sigma, "rms_contrast": sigma / mu}.
+    """
+    p = np.bincount(gray.ravel(), minlength=256) / gray.size  # share of each grey level
+    p = p[p > 0]
+    mu, sigma = float(gray.mean()), float(gray.std())
+    return {
+        "entropy": float(-np.sum(p * np.log2(p))),
+        "mean": mu,
+        "std": sigma,
+        "rms_contrast": sigma / mu if mu > 0 else 0.0,
+    }
+
+
+def colour_features(rgb: np.ndarray) -> dict[str, float]:
+    """Return mean channels, chromaticities, B/R ratio, mean S and V, and the circular mean hue.
+
+    Args:
+        rgb (np.ndarray): RGB tile, uint8, shape (384, 384, 3).
+
+    Returns:
+        dict[str, float]: mean_r, mean_g, mean_b, chroma_r, chroma_g, chroma_b, b_over_r,
+            mean_s, mean_v (0-255), hue_cos, hue_sin (mean hue as a point on the unit circle).
+    """
+    r, g, b = rgb.reshape(-1, 3).mean(axis=0)
+    total = r + g + b
+    hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)       # OpenCV: H 0-179 (2 deg steps), S and V 0-255
+    hue = hsv[..., 0].astype(np.float64) * np.pi / 90  # -> radians
+    sat = hsv[..., 1].astype(np.float64)
+    mean_hue = np.arctan2(np.sum(sat * np.sin(hue)), np.sum(sat * np.cos(hue)))  # weighted by S
+    return {
+        "mean_r": float(r), "mean_g": float(g), "mean_b": float(b),
+        "chroma_r": float(r / total), "chroma_g": float(g / total), "chroma_b": float(b / total),
+        "b_over_r": float(b / r) if r > 0 else 0.0,
+        "mean_s": float(sat.mean()), "mean_v": float(hsv[..., 2].mean()),
+        "hue_cos": float(np.cos(mean_hue)), "hue_sin": float(np.sin(mean_hue)),
+    }
+
+
+def globule_deviation(gray: np.ndarray, sigma: float) -> np.ndarray:
+    """Return D = |I - I * G_sigma|: how much each pixel differs from the local background.
+
+    Args:
+        gray (np.ndarray): grey tile, uint8, shape (384, 384).
+        sigma (float): standard deviation of the Gaussian blur in px, e.g. 15.
+
+    Returns:
+        np.ndarray: float32 array of the same shape; high on globules, near 0 on background.
+    """
+    g = gray.astype(np.float32)
+    background = cv2.GaussianBlur(g, (0, 0), sigma)
+    return np.abs(g - background)
+
+
+def histogram_features(rgb: np.ndarray, gray: np.ndarray) -> dict[str, float]:
+    """Return the normalised histograms (each sums to 1) as separate features.
+
+    Args:
+        rgb (np.ndarray): RGB tile, uint8, shape (384, 384, 3).
+        gray (np.ndarray): the same tile in grey, uint8, shape (384, 384).
+
+    Returns:
+        dict[str, float]: hist_bright_00-15 (grey level, 16 bins of 16), hist_hue_00-17 (18 bins of
+            20 deg, weighted by saturation), hist_sat_00-15 (16 bins), hist_grad_00-15 (16 bins of
+            log(1 + gradient magnitude) on 0-7.3), hist_lbp_0-9 (uniform LBP codes, P = 8, R = 1).
+    """
+    n = gray.size
+    hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+    hue_deg = hsv[..., 0].astype(np.float64) * 2
+    sat = hsv[..., 1].astype(np.float64)
+    g = gray.astype(np.float64)
+    grad = np.sqrt(cv2.Sobel(g, cv2.CV_64F, 1, 0, ksize=3) ** 2 + cv2.Sobel(g, cv2.CV_64F, 0, 1, ksize=3) ** 2)
+
+    bright = np.histogram(gray, bins=16, range=(0, 256))[0] / n
+    hue = np.histogram(hue_deg, bins=18, range=(0, 360), weights=sat)[0]
+    hue = hue / hue.sum() if hue.sum() > 0 else hue
+    sat_hist = np.histogram(sat, bins=16, range=(0, 256))[0] / n
+    grad_hist = np.histogram(np.log1p(grad), bins=16, range=(0, 7.3))[0] / n  # max log1p(1443) = 7.27
+    lbp = np.bincount(local_binary_pattern(gray, P=8, R=1, method="uniform").astype(int).ravel(),
+                      minlength=10) / n
+
+    features = {}
+    for name, hist in [("bright", bright), ("hue", hue), ("sat", sat_hist), ("grad", grad_hist)]:
+        features.update({f"hist_{name}_{k:02d}": float(v) for k, v in enumerate(hist)})
+    features.update({f"hist_lbp_{k}": float(v) for k, v in enumerate(lbp)})
+    return features
+
+
+def tile_features(rgb: np.ndarray, globule_threshold: float, sigma: float) -> dict[str, float]:
+    """Return all features of one tile (definitions in "# Classical methods").
+
+    Args:
+        rgb (np.ndarray): RGB tile, uint8, shape (384, 384, 3).
+        globule_threshold (float): fixed threshold t on D for the globule area, e.g. 6.5.
+        sigma (float): Gaussian blur for the local background in px, e.g. 15.
+
+    Returns:
+        dict[str, float]: 19 single-value features (focus, grey-level, colour, globule_area)
+            followed by 76 histogram bins (95 values in total).
+    """
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+    return {
+        **focus_features(gray),
+        **grey_features(gray),
+        **colour_features(rgb),
+        "globule_area": float(np.mean(globule_deviation(gray, sigma) > globule_threshold)),
+        **histogram_features(rgb, gray),
+    }
 
 
 # %% [markdown]
@@ -1039,6 +1205,103 @@ load_options.round(1)
 # - **Image score** from the 12 tile scores $s_1, \dots, s_{12}$:
 #   $s_{\text{img}} = \max_t s_t$ (catches local defects such as bubbles) or
 #   $s_{\text{img}} = \frac{1}{12} \sum_t s_t$ (steadier for whole-image defects).
+
+# %% [markdown]
+# ## Features of example tiles
+#
+# The features computed on one tile per label (tile `FEATURE_EXAMPLE_TILE` of the first image of
+# each label), to check them visually before computing them for all 47,592 tiles.
+# The globule threshold $t$ is found once with Otsu's method on `GLOBULE_SAMPLE_TILES` random good
+# tiles (like the ROI, which used all good images) and then used for every tile.
+
+# %%
+# Globule threshold t: Otsu's method on the pooled values of D from random good tiles
+rng = np.random.default_rng(SEED)
+good_tiles = data["TILES"][data["TILES"]["label"] == "good"]
+d_counts = np.zeros(256)
+for r in good_tiles.iloc[rng.choice(len(good_tiles), GLOBULE_SAMPLE_TILES, replace=False)].itertuples():
+    tile_gray = cv2.cvtColor(load_roi(Path(r.path), (r.x0, r.y0, r.x1, r.y1)), cv2.COLOR_RGB2GRAY)
+    d_counts += np.histogram(globule_deviation(tile_gray, GLOBULE_BLUR_SIGMA), bins=256, range=(0, 256))[0]
+data["GLOBULE_THRESHOLD"] = float(threshold_otsu(hist=(d_counts, np.arange(256) + 0.5)))
+print(f"Globule threshold t = {data['GLOBULE_THRESHOLD']:.1f} grey levels "
+      f"(from {GLOBULE_SAMPLE_TILES} good tiles)")
+
+# %%
+# One example tile per label and its features
+first_files = data["TILES"].drop_duplicates("label")["file"]  # first image of every label
+feature_rows = data["TILES"][
+    data["TILES"]["file"].isin(first_files) & (data["TILES"]["tile_idx"] == FEATURE_EXAMPLE_TILE)
+]
+example_tiles = {r.label: load_roi(Path(r.path), (r.x0, r.y0, r.x1, r.y1)) for r in feature_rows.itertuples()}
+example_features = pd.DataFrame({
+    label: tile_features(tile, data["GLOBULE_THRESHOLD"], GLOBULE_BLUR_SIGMA)
+    for label, tile in example_tiles.items()
+})  # rows = features, columns = labels
+print(f"{len(example_features)} features per tile")
+example_features[~example_features.index.str.startswith("hist_")].round(3)  # the 19 single values
+
+# %%
+# What the focus and globule features "see": maps on the same scale for every label
+gray_ex = {label: cv2.cvtColor(t, cv2.COLOR_RGB2GRAY).astype(np.float64) for label, t in example_tiles.items()}
+lap_ex = {label: np.abs(cv2.Laplacian(g, cv2.CV_64F)) for label, g in gray_ex.items()}
+grad_ex = {label: np.hypot(cv2.Sobel(g, cv2.CV_64F, 1, 0), cv2.Sobel(g, cv2.CV_64F, 0, 1))
+           for label, g in gray_ex.items()}
+lap_max = np.percentile(lap_ex["good"], 99)    # common colour scale, set by the good tile
+grad_max = np.percentile(grad_ex["good"], 99)
+
+fig, axes = plt.subplots(len(example_tiles), 4, figsize=(13, 3.3 * len(example_tiles)), constrained_layout=True)
+for row, label in zip(axes, example_tiles):
+    f = example_features[label]
+    mask = globule_deviation(gray_ex[label].astype(np.uint8), GLOBULE_BLUR_SIGMA) > data["GLOBULE_THRESHOLD"]
+    overlay = np.dstack([gray_ex[label] / 255] * 3)
+    overlay[mask] = 0.6 * overlay[mask] + 0.4 * np.array([0x2A, 0x78, 0xD6]) / 255  # SERIES_COLOUR
+    panels = [
+        (example_tiles[label], None, f"{label}\ntile {FEATURE_EXAMPLE_TILE}"),
+        (lap_ex[label], lap_max, f"|Laplacian|   VoL = {f['vol']:.0f}"),
+        (grad_ex[label], grad_max, f"gradient magnitude   TEN = {f['tenengrad']:.0f}"),
+        (overlay, None, f"globule mask   A = {f['globule_area']:.3f}"),
+    ]
+    for ax, (img, vmax, title) in zip(row, panels):
+        ax.imshow(img, cmap="Greys" if vmax else None, vmin=0, vmax=vmax)
+        ax.set_title(title, fontsize=10)
+        ax.axis("off")
+fig.suptitle("Focus and globule features of one tile per label (maps on the scale of the good tile)",
+             fontsize=13)
+save_figure(fig, RESULTS_DIR / "feature_maps_example.png", OVERWRITE)
+plt.show()
+
+# %%
+# Histograms of every label (blue) compared with the good tile (grey line)
+hist_types = [  # (feature prefix, title, x-axis label, bin edges)
+    ("hist_bright", "brightness", "grey level", np.linspace(0, 256, 17)),
+    ("hist_hue", "hue (weighted by saturation)", "hue [deg]", np.linspace(0, 360, 19)),
+    ("hist_sat", "saturation", "saturation", np.linspace(0, 256, 17)),
+    ("hist_grad", "gradient magnitude", "log(1 + |grad I|)", np.linspace(0, 7.3, 17)),
+    ("hist_lbp", "LBP texture codes", "uniform LBP code", np.arange(11) - 0.5),
+]
+fig, axes = plt.subplots(len(example_tiles), len(hist_types),
+                         figsize=(20, 2.2 * len(example_tiles)), constrained_layout=True, sharex="col")
+for i, (row, label) in enumerate(zip(axes, example_tiles)):
+    for ax, (prefix, title, xlabel, edges) in zip(row, hist_types):
+        values = example_features.loc[example_features.index.str.startswith(prefix), label].to_numpy()
+        reference = example_features.loc[example_features.index.str.startswith(prefix), "good"].to_numpy()
+        centres, width = (edges[:-1] + edges[1:]) / 2, np.diff(edges)
+        ax.bar(centres, values, width=0.85 * width, color=SERIES_COLOUR, label="this label")
+        ax.step(edges, np.r_[reference, reference[-1]], where="post", color=REFERENCE_COLOUR,
+                lw=1.5, label="good (reference)")
+        ax.tick_params(labelsize=8)
+        ax.spines[["top", "right"]].set_visible(False)
+        if i == 0:                  # first row: column titles
+            ax.set_title(title, fontsize=11)
+        if i == len(axes) - 1:      # last row: x-axis labels
+            ax.set_xlabel(xlabel)
+    row[0].set_ylabel(f"{label}\nshare of pixels", fontsize=9)
+handles, labels = axes[0, 0].get_legend_handles_labels()
+fig.legend(handles, labels, loc="upper right", ncol=2, frameon=False)
+fig.suptitle(f"Histogram features of tile {FEATURE_EXAMPLE_TILE} of the first image of every label",
+             fontsize=13)
+save_figure(fig, RESULTS_DIR / "histograms_example.png", OVERWRITE)
+plt.show()
 
 # %% [markdown]
 # # Experiments
