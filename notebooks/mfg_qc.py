@@ -44,6 +44,8 @@ ROI_THRESHOLD = 0.8        # sharp area = at least 80 % of the sharpness in the 
 CROP_SIZE = 384            # px, side of one tile
 ROI = (256, 192, 1792, 1344)            # x0, y0, x1, y1 in px: 4 x 3 tiles of 384 px, centred
 ROI_FIRST_GUESS = (250, 200, 1750, 1400)  # x0, y0, x1, y1: first box chosen by eye (for comparison)
+WHOLE_SIZE = (768, 576)    # (width, height) in px of the whole-picture input: the ROI scaled to half
+EXAMPLE_IMAGE = "A01_0141.png"  # corner image used to show what the models get
 
 # Image number -> label for A preparations (CLAUDE.md §7.2): (last image number, label)
 LABELS_A = [
@@ -385,6 +387,60 @@ def build_tile_table(manifest: pd.DataFrame, roi: tuple[int, int, int, int], til
     return images.merge(grid, how="cross")  # every image x every tile
 
 
+def load_roi(path: Path, roi: tuple[int, int, int, int]) -> np.ndarray:
+    """Read one image and return its ROI in RGB at full resolution.
+
+    Args:
+        path (Path): image file, e.g. Path(".../A/A01/A01_0141.png").
+        roi (tuple[int, int, int, int]): (x0, y0, x1, y1) in px, e.g. (256, 192, 1792, 1344).
+
+    Returns:
+        np.ndarray: uint8 array of shape (height, width, 3) in RGB, e.g. (1152, 1536, 3).
+
+    Raises:
+        FileNotFoundError: if the image cannot be read.
+    """
+    img = cv2.imread(str(path))  # BGR, (1536, 2048, 3)
+    if img is None:
+        raise FileNotFoundError(f"Cannot read {path}")
+    x0, y0, x1, y1 = roi
+    return cv2.cvtColor(img[y0:y1, x0:x1], cv2.COLOR_BGR2RGB)
+
+
+def cut_tiles(roi_img: np.ndarray, tile: int) -> np.ndarray:
+    """Cut a ROI into square tiles, row by row from the top left (same order as tile_idx).
+
+    Args:
+        roi_img (np.ndarray): ROI of shape (height, width, 3), e.g. (1152, 1536, 3).
+        tile (int): side of one tile in px, e.g. 384. Must divide the ROI width and height.
+
+    Returns:
+        np.ndarray: array of shape (n_tiles, tile, tile, 3), e.g. (12, 384, 384, 3).
+
+    Raises:
+        ValueError: if the tile size does not divide the ROI size.
+    """
+    h, w, c = roi_img.shape
+    if h % tile or w % tile:
+        raise ValueError(f"Tile size {tile} does not divide the ROI {w} x {h}")
+    rows, cols = h // tile, w // tile  # 3, 4
+    # (h, w, c) -> (rows, tile, cols, tile, c) -> (rows, cols, tile, tile, c) -> (rows * cols, tile, tile, c)
+    return roi_img.reshape(rows, tile, cols, tile, c).transpose(0, 2, 1, 3, 4).reshape(-1, tile, tile, c)
+
+
+def shrink_roi(roi_img: np.ndarray, size: tuple[int, int]) -> np.ndarray:
+    """Scale the whole ROI down to the whole-picture input size (area interpolation, best for shrinking).
+
+    Args:
+        roi_img (np.ndarray): ROI of shape (height, width, 3), e.g. (1152, 1536, 3).
+        size (tuple[int, int]): output (width, height) in px, e.g. (768, 576).
+
+    Returns:
+        np.ndarray: uint8 array of shape (height, width, 3), e.g. (576, 768, 3).
+    """
+    return cv2.resize(roi_img, size, interpolation=cv2.INTER_AREA)
+
+
 # %% [markdown]
 # # Loading data
 
@@ -641,6 +697,53 @@ data["TILES"].head(12)  # the 12 tiles of the first image
 data["TILES"].assign(
     fold_name=lambda d: ("fold " + d["fold"].astype("string")).fillna("test only")
 ).pivot_table(index="label", columns="fold_name", values="file", aggfunc="size", fill_value=0)
+
+# %% [markdown]
+# ## ROI and tiles of one image
+#
+# What the models get from one image (`EXAMPLE_IMAGE`): the ROI (1536 x 1152 px) cut into 12 tiles
+# of 384 x 384 px at full resolution, and the whole ROI scaled to 768 x 576 px (half size).
+
+# %%
+example_rows = data["TILES"][data["TILES"]["file"] == EXAMPLE_IMAGE]
+example_path = Path(example_rows["path"].iloc[0])
+roi_img = load_roi(example_path, ROI)
+tiles = cut_tiles(roi_img, CROP_SIZE)
+whole = shrink_roi(roi_img, WHOLE_SIZE)
+
+# Check: every tile is exactly the image cut at the coordinates in the tile table
+full_img = cv2.cvtColor(cv2.imread(str(example_path)), cv2.COLOR_BGR2RGB)
+tiles_match = all(
+    np.array_equal(tiles[r.tile_idx], full_img[r.y0:r.y1, r.x0:r.x1]) for r in example_rows.itertuples()
+)
+print(f"ROI {roi_img.shape}, tiles {tiles.shape}, whole picture {whole.shape}")
+print("Tiles match the tile-table coordinates:", tiles_match)
+
+# %%
+fig = plt.figure(figsize=(24, 8.5), constrained_layout=True)
+fig_tiles, fig_whole = fig.subfigures(1, 2, width_ratios=[1, 1])
+
+# Left: the 12 tiles, as the tile models see them (384 x 384 px each)
+for r, ax in zip(example_rows.itertuples(), fig_tiles.subplots(3, 4).flat):
+    ax.imshow(tiles[r.tile_idx])
+    ax.set_title(f"tile {r.tile_idx}  (x {r.x0}-{r.x1}, y {r.y0}-{r.y1})", fontsize=9)
+    ax.tick_params(labelsize=7)
+fig_tiles.suptitle(f"12 tiles of {CROP_SIZE} x {CROP_SIZE} px (full resolution), axes in px of the tile")
+
+# Right: the whole ROI scaled to WHOLE_SIZE, as the whole-picture model sees it
+ax = fig_whole.subplots()
+ax.imshow(whole)
+ax.set(xlabel="x [px]", ylabel="y [px]")
+fig_whole.suptitle(f"Whole ROI scaled to {WHOLE_SIZE[0]} x {WHOLE_SIZE[1]} px (half size)")
+fig.suptitle(f"What the models get from {EXAMPLE_IMAGE} ({example_rows['label'].iloc[0]})", fontsize=15)
+
+fig_path = RESULTS_DIR / "model_inputs_example.png"
+if fig_path.exists() and not OVERWRITE:
+    print(f"Not saved, file exists (set OVERWRITE = True to replace): {fig_path}")
+else:
+    fig.savefig(fig_path, dpi=100)
+    print("Saved", fig_path)
+plt.show()
 
 # %% [markdown]
 # # Experiments
