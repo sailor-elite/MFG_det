@@ -20,6 +20,7 @@
 # %%
 import os
 import shutil
+from datetime import datetime
 from pathlib import Path
 
 import cv2
@@ -32,25 +33,17 @@ from matplotlib.patches import Rectangle
 RAW_DIR = Path("/home/qq/Pictures/MFG_det")  # raw micrographs, READ ONLY
 MFG_DIR = Path("/home/qq/mfg_qc/data/MFG")    # copies of the raw images, one folder per label
 EXCLUDED_CSV = Path("/home/qq/mfg_qc/data/excluded_images.csv")  # images removed for bad quality
+MANIFEST_CSV = Path("/home/qq/mfg_qc/data/manifest.csv")  # one row per raw image (labels, preps, folds)
 RESULTS_DIR = Path("/home/qq/mfg_qc/results")  # figures and tables (also for the paper)
 OVERWRITE = False  # False = never overwrite files that already exist in RESULTS_DIR
 SEED = 0           # random seed for everything
 
 # ROI (CLAUDE.md §9 Step 1) and tiles (Step 2)
 SHARP_TILE = 64            # px, cell size of the sharpness map (2048 x 1536 frame -> 32 x 24 cells)
-ROI_IMAGES_PER_PREP = 2    # random good images per A preparation for the sharpness map (16 x 2 = 32)
 ROI_THRESHOLD = 0.8        # sharp area = at least 80 % of the sharpness in the frame centre
 CROP_SIZE = 384            # px, side of one tile
 ROI = (256, 192, 1792, 1344)            # x0, y0, x1, y1 in px: 4 x 3 tiles of 384 px, centred
 ROI_FIRST_GUESS = (250, 200, 1750, 1400)  # x0, y0, x1, y1: first box chosen by eye (for comparison)
-TILE_EXAMPLES = [  # one image per label for the tile-grid figure
-    "A01_0001.png",  # good
-    "A01_0041.png",  # blur_light
-    "A01_0121.png",  # bubbles
-    "A01_0141.png",  # corner
-    "C01_0001.png",  # undiluted
-    "D01_0001.png",  # overdiluted
-]
 
 # Image number -> label for A preparations (CLAUDE.md §7.2): (last image number, label)
 LABELS_A = [
@@ -62,13 +55,86 @@ LABELS_A = [
     (140, "bubbles"),
     (160, "corner"),
 ]
-# B, C, D, F, U preparations: one label for all images (1-80); F and U are test-only good images
+# B, C, D, F, U preparations: one label for all images (1-80).
+# F and U (frozen and UHT milk) look clearly different from fresh milk: they count as defective
+# ("to be flagged") and are TEST ONLY, never used for training.
 LABELS_BY_TYPE = {
     "B": "overstained",
     "C": "undiluted",
     "D": "overdiluted",
-    "F": "good_frozen",
-    "U": "good_uht",
+    "F": "frozen",
+    "U": "uht",
+}
+
+# Label -> label group (CLAUDE.md §7.2); frozen and uht: other milk type (counted as defective)
+LABEL_GROUPS = {
+    "good": "good",
+    "blur_light": "acquisition",
+    "blur_heavy": "acquisition",
+    "filter_yellow": "acquisition",
+    "filter_blue": "acquisition",
+    "bubbles": "preparation",
+    "overstained": "preparation",
+    "undiluted": "preparation",
+    "overdiluted": "preparation",
+    "corner": "field_position",
+    "frozen": "other_milk",
+    "uht": "other_milk",
+}
+
+# Expected number of raw images per label (CLAUDE.md §7.3)
+EXPECTED_COUNTS = {
+    "good": 640, "blur_light": 320, "blur_heavy": 320, "filter_yellow": 320, "filter_blue": 320,
+    "bubbles": 320, "corner": 320, "overstained": 320, "undiluted": 320, "overdiluted": 320,
+    "frozen": 240, "uht": 240,
+}
+
+# Preparation log (CLAUDE.md §7.4, same as Dziennik_pomiary.xlsx):
+# prep -> (distilled water [ml], milk type, day, preparation time, start of imaging)
+# U01-U03: the log says "any day"; the file times show 2026-11-01.
+PREP_LOG = {
+    "A01": (1.5, "fresh", "2026-10-31", "22:10", "22:32"),
+    "A02": (2.5, "fresh", "2026-11-01", "08:48", "09:08"),
+    "A03": (3.5, "fresh", "2026-10-31", "19:42", "19:47"),
+    "A04": (1.5, "fresh", "2026-10-31", "21:10", "21:34"),
+    "A05": (2.5, "fresh", "2026-11-01", "09:09", "09:16"),
+    "A06": (3.5, "fresh", "2026-10-31", "19:49", "20:06"),
+    "A07": (1.5, "fresh", "2026-10-31", "21:35", "21:50"),
+    "A08": (2.5, "fresh", "2026-11-01", "09:17", "09:24"),
+    "A09": (3.5, "fresh", "2026-10-31", "20:07", "20:20"),
+    "A10": (1.5, "fresh", "2026-10-31", "21:50", "22:03"),
+    "A11": (2.5, "fresh", "2026-11-01", "09:40", "09:46"),
+    "A12": (3.5, "fresh", "2026-10-31", "20:22", "20:31"),
+    "A13": (1.5, "fresh", "2026-11-01", "08:08", "08:22"),
+    "A14": (2.5, "fresh", "2026-11-01", "09:48", "10:07"),
+    "A15": (3.5, "fresh", "2026-10-31", "20:34", "20:45"),
+    "A16": (1.5, "fresh", "2026-11-01", "08:23", "08:34"),
+    "B01": (1.5, "fresh", "2026-11-01", "12:49", "12:52"),
+    "B02": (1.5, "fresh", "2026-11-01", "12:53", "12:58"),
+    "B03": (1.5, "fresh", "2026-11-01", "12:58", "13:01"),
+    "B04": (1.5, "fresh", "2026-11-01", "13:01", "13:04"),
+    "C01": (0.0, "fresh", "2026-11-01", "10:29", "10:37"),
+    "C02": (0.0, "fresh", "2026-11-01", "10:39", "10:46"),
+    "C03": (0.0, "fresh", "2026-11-01", "10:50", "10:56"),
+    "C04": (0.0, "fresh", "2026-11-01", "10:57", "11:05"),
+    "D01": (20.0, "fresh", "2026-11-01", "11:50", "11:59"),
+    "D02": (20.0, "fresh", "2026-11-01", "12:00", "12:14"),
+    "D03": (20.0, "fresh", "2026-11-01", "12:30", "12:35"),
+    "D04": (20.0, "fresh", "2026-11-01", "12:36", "12:37"),
+    "F01": (3.5, "frozen", "2026-11-01", "13:08", "13:13"),
+    "F02": (3.5, "frozen", "2026-11-01", "13:15", "13:17"),
+    "F03": (3.5, "frozen", "2026-11-01", "13:19", "13:22"),
+    "U01": (3.5, "UHT", "2026-11-01", "14:22", "14:31"),
+    "U02": (3.5, "UHT", "2026-11-01", "14:32", "14:36"),
+    "U03": (3.5, "UHT", "2026-11-01", "14:37", "14:39"),
+}
+
+# Fixed folds (CLAUDE.md §9 Step 6). F and U are not in any fold: they are test only.
+FOLDS = {
+    1: ["A01", "A02", "A03", "A13", "B01", "C01", "D01"],
+    2: ["A04", "A05", "A06", "A16", "B02", "C02", "D02"],
+    3: ["A07", "A08", "A09", "A14", "B03", "C03", "D03"],
+    4: ["A10", "A11", "A12", "A15", "B04", "C04", "D04"],
 }
 
 data = {}
@@ -106,6 +172,65 @@ def label_of(path: Path) -> str:
         return LABELS_BY_TYPE[prep_type]
 
     raise ValueError(f"No label defined for {path.name}")
+
+
+def build_manifest(paths: list[Path], excluded_names: set[str]) -> pd.DataFrame:
+    """Build the manifest: one row per raw image with its label, preparation details and fold.
+
+    Uses label_of() and the Config globals LABEL_GROUPS, PREP_LOG and FOLDS.
+
+    Args:
+        paths (list[Path]): all raw image files, e.g. data["RAW_PICTURES"] (4000 paths).
+        excluded_names (set[str]): file names removed for bad quality,
+            e.g. {"A02_0009.png", "A08_0001.png", ...}.
+
+    Returns:
+        pd.DataFrame: one row per image, sorted by file name, with columns
+            path (str): raw image path,
+            file (str): file name, e.g. "A01_0042.png",
+            prep_id (str): e.g. "A01"; prep_type (str): e.g. "A",
+            image_idx (int): image number, e.g. 42,
+            label (str): e.g. "blur_light"; label_group (str): e.g. "acquisition",
+            is_defect (bool): True for every label except "good" (frozen and uht included),
+            dilution_ml (float): distilled water added, e.g. 1.5,
+            day (str): e.g. "2026-10-31"; milk_type (str): "fresh", "frozen" or "UHT",
+            prep_time, photo_time (str): from the log, e.g. "2026-10-31 22:10",
+            file_time (str): modification time of the raw file, e.g. "2026-10-31 22:35:12",
+            fold (Int64): 1-4, <NA> for test-only preparations,
+            test_only (bool): True for F and U (never used for training),
+            excluded (bool): True if removed for bad quality.
+
+    Raises:
+        KeyError: if a preparation is missing from PREP_LOG.
+    """
+    fold_of = {prep: fold for fold, preps in FOLDS.items() for prep in preps}  # "A01" -> 1
+    rows = []
+    for path in paths:
+        prep_id, image_idx = path.stem.split("_")  # "A01_0042" -> "A01", "0042"
+        water_ml, milk_type, day, prep_time, photo_time = PREP_LOG[prep_id]
+        label = label_of(path)
+        rows.append({
+            "path": str(path),
+            "file": path.name,
+            "prep_id": prep_id,
+            "prep_type": prep_id[0],
+            "image_idx": int(image_idx),
+            "label": label,
+            "label_group": LABEL_GROUPS[label],
+            "is_defect": label != "good",
+            "dilution_ml": water_ml,
+            "day": day,
+            "milk_type": milk_type,
+            "prep_time": f"{day} {prep_time}",
+            "photo_time": f"{day} {photo_time}",
+            "file_time": datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S"),
+            "fold": fold_of.get(prep_id),  # None for F and U
+            "test_only": prep_id not in fold_of,
+            "excluded": path.name in excluded_names,
+        })
+    manifest = pd.DataFrame(rows).sort_values("file", ignore_index=True)
+    manifest["fold"] = manifest["fold"].astype("Int64")
+    return manifest
 
 
 def copy_pictures_by_label(
@@ -244,7 +369,7 @@ for p in data["RAW_PICTURES"]:
 # | good | 31 excluded (blurry, accidental defocus) |
 # | blur_light | 1 excluded |
 # | bubbles | 2 excluded |
-# | blur_heavy, corner, overstained, undiluted, overdiluted, good_frozen, good_uht | all OK |
+# | blur_heavy, corner, overstained, undiluted, overdiluted, frozen, uht | all OK |
 # | filter_yellow, filter_blue | all OK; also confirmed by a mean-colour check (no overlap with other classes) |
 #
 # Images that have a second defect (e.g. a blurry `filter_yellow` image) stay in their class.
@@ -282,25 +407,59 @@ for ax, (label, paths) in zip(axes.flat, data["PICTURES_BY_LABEL"].items()):
 plt.show()
 
 # %% [markdown]
+# # Creating manifest
+#
+# One row per raw image (all 4000; the excluded images are kept and flagged) with its label, the
+# preparation details from the preparation log (CLAUDE.md §7.4) and the fold (§9 Step 6).
+# F and U have no fold: they are test only. Saved to `data/manifest.csv`; later steps read it.
+
+# %%
+data["MANIFEST"] = build_manifest(data["RAW_PICTURES"], set(data["EXCLUDED"]["file"]))
+data["MANIFEST"].head()
+
+# %%
+# Check: raw images per label vs CLAUDE.md §7.3, and images used (not excluded) per fold
+m = data["MANIFEST"]
+manifest_check = m.groupby("label", sort=False).agg(raw=("file", "size"), excluded=("excluded", "sum"))
+manifest_check["expected_raw"] = pd.Series(EXPECTED_COUNTS)
+manifest_check["ok"] = manifest_check["raw"] == manifest_check["expected_raw"]
+
+used = m[~m["excluded"]].assign(
+    fold_name=lambda d: ("fold " + d["fold"].astype("string")).fillna("test only")
+)
+manifest_check = manifest_check.join(
+    used.pivot_table(index="label", columns="fold_name", values="file", aggfunc="size", fill_value=0)
+)
+if not manifest_check["ok"].all():
+    print("COUNTS DIFFER FROM CLAUDE.md §7.3 - check before going on!")
+manifest_check
+
+# %%
+# Save data/manifest.csv (an existing, different file is only replaced when OVERWRITE = True)
+manifest_text = data["MANIFEST"].to_csv(index=False)
+if not MANIFEST_CSV.exists():
+    MANIFEST_CSV.write_text(manifest_text)
+    print("Saved", MANIFEST_CSV)
+elif MANIFEST_CSV.read_text() == manifest_text:
+    print("Unchanged:", MANIFEST_CSV)
+elif OVERWRITE:
+    MANIFEST_CSV.write_text(manifest_text)
+    print("Replaced", MANIFEST_CSV)
+else:
+    print(f"NOT saved: {MANIFEST_CSV} exists and differs (set OVERWRITE = True to replace it)")
+
+# %% [markdown]
 # # ROI
 #
 # The edges of every frame are softer than the centre (field curvature, vignetting), so only a
 # central region of interest (ROI) is used. Sharpness map: variance of the Laplacian in 64 x 64 px
-# cells, averaged over random good images (2 per A preparation), divided by the sharpness in the
+# cells, averaged over all good images (after exclusions), divided by the sharpness in the
 # centre (central 256 x 256 px). The sharp area is where this relative sharpness is at least 80 %.
 # The ROI (4 x 3 tiles of 384 px, centred) should lie inside the sharp area.
 
 # %%
-# Pick ROI_IMAGES_PER_PREP random good images from every A preparation
-rng = np.random.default_rng(SEED)
-good_by_prep = {}
-for p in data["PICTURES_BY_LABEL"]["good"]:
-    good_by_prep.setdefault(p.name[:3], []).append(p)  # "A01_0001.png" -> "A01"
-data["ROI_IMAGES"] = [
-    good_by_prep[prep][i]
-    for prep in sorted(good_by_prep)
-    for i in sorted(rng.choice(len(good_by_prep[prep]), ROI_IMAGES_PER_PREP, replace=False))
-]
+# All good images (after exclusions) are used for the sharpness map (takes about 35 s)
+data["ROI_IMAGES"] = data["PICTURES_BY_LABEL"]["good"]
 
 # Average sharpness map, relative to the centre of the frame
 mean_map = np.mean([sharpness_map(p, SHARP_TILE) for p in data["ROI_IMAGES"]], axis=0)
@@ -308,7 +467,7 @@ rows, cols = mean_map.shape  # (24, 32)
 centre = mean_map[rows // 2 - 2:rows // 2 + 2, cols // 2 - 2:cols // 2 + 2].mean()
 data["SHARPNESS_MAP"] = mean_map / centre
 
-print(len(data["ROI_IMAGES"]), "images:", ", ".join(p.name for p in data["ROI_IMAGES"]))
+print(len(data["ROI_IMAGES"]), "good images used")
 
 # %%
 rel = data["SHARPNESS_MAP"]
@@ -376,15 +535,14 @@ else:
 plt.show()
 
 # %%
-# The ROI cut into tiles of CROP_SIZE px, drawn on the example images (TILE_EXAMPLES)
-by_name = {p.name: (label, p) for label, paths in data["PICTURES_BY_LABEL"].items() for p in paths}
+# The ROI cut into tiles of CROP_SIZE px, drawn on the first image of every label (12 labels)
 x0, y0, x1, y1 = ROI
 n_cols = (x1 - x0) // CROP_SIZE            # 4
 n_tiles = n_cols * ((y1 - y0) // CROP_SIZE)  # 12
 
-fig, axes = plt.subplots(2, 3, figsize=(21, 11), constrained_layout=True)
-for ax, name in zip(axes.flat, TILE_EXAMPLES):
-    label, path = by_name[name]
+fig, axes = plt.subplots(3, 4, figsize=(24, 15), constrained_layout=True)
+for ax, (label, paths) in zip(axes.flat, data["PICTURES_BY_LABEL"].items()):
+    path = paths[0]
     img = cv2.cvtColor(cv2.imread(str(path)), cv2.COLOR_BGR2RGB)[y0:y1, x0:x1]  # ROI only
     ax.imshow(img, extent=(x0, x1, y1, y0))  # axes in px of the full frame
     for x in range(x0, x1 + 1, CROP_SIZE):
@@ -395,7 +553,7 @@ for ax, name in zip(axes.flat, TILE_EXAMPLES):
         row, col = divmod(k, n_cols)  # tile number -> (row, column), e.g. 5 -> (1, 1)
         ax.text(x0 + col * CROP_SIZE + 15, y0 + row * CROP_SIZE + 55, str(k),
                 color="yellow", fontsize=15, weight="bold")
-    ax.set_title(f"{label} ({name})", fontsize=14)
+    ax.set_title(f"{label} ({path.name})", fontsize=14)
     ax.set_xlabel("x [px]")
     ax.set_ylabel("y [px]")
 fig.suptitle(f"ROI (x {x0}-{x1}, y {y0}-{y1}) cut into {n_tiles} tiles of {CROP_SIZE} x {CROP_SIZE} px",
