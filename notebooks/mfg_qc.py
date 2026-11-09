@@ -947,4 +947,98 @@ load_options[f"1 pass, {DATA_WORKERS} workers [s]"] = n_images / load_options[f"
 load_options.round(1)
 
 # %% [markdown]
+# # Classical methods
+#
+# Handcrafted features computed on every tile (CLAUDE.md §9 Step 3), then turned into a
+# good / defective decision.
+
+# %% [markdown]
+# ## Feature definitions
+#
+# **Notation.** A tile has $N = 384 \times 384$ pixels at positions $(x, y)$. $R, G, B \in [0, 255]$
+# are the colour channels and $I(x, y) = 0.299R + 0.587G + 0.114B$ is the grey level (as in OpenCV).
+# $\ast$ is convolution (sliding a small weight matrix over the image).
+#
+# ### 1. Focus (sharpness)
+# A sharp tile has strong, sudden changes of brightness at globule edges; blur smooths them away.
+#
+# **Variance of the Laplacian** (the Laplacian is large where brightness bends sharply):
+# $$L = I \ast \begin{pmatrix} 0 & 1 & 0 \\ 1 & -4 & 1 \\ 0 & 1 & 0 \end{pmatrix}, \qquad
+# \mathrm{VoL} = \frac{1}{N} \sum_{x,y} \bigl(L(x,y) - \bar{L}\bigr)^2$$
+#
+# **Tenengrad** (energy of the Sobel gradient):
+# $$I_x = I \ast S, \quad I_y = I \ast S^{\top}, \quad
+# S = \begin{pmatrix} -1 & 0 & 1 \\ -2 & 0 & 2 \\ -1 & 0 & 1 \end{pmatrix}, \qquad
+# \mathrm{TEN} = \frac{1}{N} \sum_{x,y} \bigl(I_x^2 + I_y^2\bigr)$$
+#
+# **Brenner** (squared difference of pixels 2 apart, in both directions):
+# $$\mathrm{BRE} = \frac{1}{N} \sum_{x,y} \Bigl[\bigl(I(x{+}2, y) - I(x, y)\bigr)^2
+# + \bigl(I(x, y{+}2) - I(x, y)\bigr)^2\Bigr]$$
+#
+# All three drop when the tile is out of focus. They also grow with the number of globules
+# (more edges), so they are only compared with good tiles, never used as absolute values.
+#
+# ### 2. Grey-level statistics
+# **Entropy** of the grey-level histogram, with $p_k$ = share of pixels with grey level $k$:
+# $$H = -\sum_{k=0}^{255} p_k \log_2 p_k \quad [\text{bits}]$$
+# Low for flat, uniform tiles (haze, empty field), high for detailed ones.
+#
+# **Mean and standard deviation** of brightness:
+# $$\mu = \frac{1}{N} \sum_{x,y} I(x,y), \qquad
+# \sigma = \sqrt{\frac{1}{N} \sum_{x,y} \bigl(I(x,y) - \mu\bigr)^2}$$
+#
+# **RMS contrast**, relative to brightness: $C_{\mathrm{rms}} = \sigma / \mu$.
+# (The classic RMS contrast is $\sigma$ of intensities scaled to $[0, 1]$, i.e. $\sigma / 255$,
+# which would only repeat $\sigma$.)
+#
+# ### 3. Colour statistics
+# **Mean channels** $\bar{R}, \bar{G}, \bar{B}$ and **chromaticities** (share of each channel,
+# independent of brightness):
+# $$r = \frac{\bar{R}}{\bar{R} + \bar{G} + \bar{B}}, \quad
+# g = \frac{\bar{G}}{\bar{R} + \bar{G} + \bar{B}}, \quad
+# b = \frac{\bar{B}}{\bar{R} + \bar{G} + \bar{B}} \quad (r + g + b = 1)$$
+# plus the **ratio** $\bar{B} / \bar{R}$ (yellow filter: much below 1, blue filter: much above 1).
+#
+# **HSV**: mean saturation $\bar{S}$ and mean value $\bar{V}$. Hue $h$ is an angle, so its mean is
+# circular, weighted by saturation (grey pixels have no meaningful hue):
+# $$\bar{h} = \operatorname{atan2}\Bigl(\sum_{x,y} S \sin h, \; \sum_{x,y} S \cos h\Bigr)$$
+# For the models, $\bar{h}$ is given as $(\cos \bar{h}, \sin \bar{h})$ so that 359° and 1° are close.
+#
+# ### 4. Globule area fraction (threshold segmentation)
+# Globules differ from the smooth background, so each pixel's distance from the local background is
+# thresholded:
+# $$D = \bigl|I - I \ast \mathcal{G}_{\sigma}\bigr|, \qquad
+# M(x,y) = \begin{cases} 1 & D(x,y) > t \\ 0 & \text{otherwise} \end{cases}, \qquad
+# A = \frac{1}{N} \sum_{x,y} M(x,y)$$
+# $\mathcal{G}_{\sigma}$ is a wide Gaussian blur (the local background, e.g. $\sigma = 15$ px) and $t$
+# is **one fixed threshold** for all tiles, found with Otsu's method on good training tiles
+# (a threshold per tile would always find "globules", even in an empty tile).
+# Undiluted: $A$ high; overdiluted: $A$ low. The segmentation is checked visually before use.
+#
+# ### 5. Histograms
+# Each histogram is divided by $N$ (sums to 1), so it describes the shape of the distribution:
+# $$h_k = \frac{1}{N} \, \#\bigl\{(x, y) : \text{value}(x, y) \in \text{bin}_k\bigr\}$$
+# - **Brightness** $I$: 16 bins of width 16.
+# - **Hue** (each pixel weighted by its saturation, 18 bins of 20°) and **saturation** (16 bins).
+# - **Gradient magnitude** $|\nabla I| = \sqrt{I_x^2 + I_y^2}$: 16 bins of $\log(1 + |\nabla I|)$,
+#   because the distribution has a long tail; a sharp tile has more pixels in the high bins.
+# - **LBP texture** (optional): each pixel gets a code from comparing it with its 8 neighbours:
+# $$\mathrm{LBP} = \sum_{p=0}^{7} s(g_p - g_c) \, 2^p, \qquad
+# s(u) = \begin{cases} 1 & u \ge 0 \\ 0 & u < 0 \end{cases}$$
+#   ($g_c$ = centre pixel, $g_p$ = neighbours). Rotation-invariant "uniform" codes give 10 bins.
+#
+# In total about 85 numbers per tile (about 95 with LBP).
+#
+# ### 6. From features to a decision
+# - **Scaling**: for linear and distance-based models every feature is standardised with the
+#   training preparations only: $z = (f - \mu_{\text{train}}) / \sigma_{\text{train}}$.
+#   Tree models (random forest, gradient boosting) do not need it.
+# - **Single feature (mode a)**: a defect can move a feature either way (blur lowers VoL, undiluted
+#   raises it), so a tile is flagged when the feature leaves the band of good validation tiles:
+#   $f < q_{2.5\%}$ or $f > q_{97.5\%}$, which gives about 5 % false alarms on good by design.
+# - **Image score** from the 12 tile scores $s_1, \dots, s_{12}$:
+#   $s_{\text{img}} = \max_t s_t$ (catches local defects such as bubbles) or
+#   $s_{\text{img}} = \frac{1}{12} \sum_t s_t$ (steadier for whole-image defects).
+
+# %% [markdown]
 # # Experiments
