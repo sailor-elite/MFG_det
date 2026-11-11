@@ -1402,6 +1402,139 @@ def summary_row(method: str, metrics: pd.DataFrame, predictions: pd.DataFrame, l
     }
 
 
+def multiclass_probabilities(
+    table: pd.DataFrame, info: pd.DataFrame, make_model, classes: list[str]
+) -> dict[int, np.ndarray]:
+    """Train a multi-class model (which label?) on the training rows of every run; return probabilities.
+
+    Args:
+        table (pd.DataFrame): one row per whole picture or tile, with "file" and the 95 feature columns.
+        info (pd.DataFrame): index = file, columns fold and label (images that are not excluded).
+        make_model (callable): makes a new untrained classifier, e.g. SUPERVISED_MODELS["LightGBM"].
+        classes (list[str]): the labels the model can choose, e.g. good + the 10 defect types.
+
+    Returns:
+        dict[int, np.ndarray]: run (1-4) -> probabilities of shape (n_rows, n_classes), columns in
+            the order of classes (each row sums to 1).
+    """
+    feature_cols = [c for c in table.columns if c not in ("file", "tile_idx")]
+    x = table[feature_cols].to_numpy(dtype=float)
+    fold, label = table["file"].map(info["fold"]), table["file"].map(info["label"])
+    probabilities = {}
+    for run in FOLDS:
+        train = ((run_roles(fold, run) == "train") & label.isin(classes)).to_numpy()
+        model = make_model()
+        model.fit(x[train], label[train].to_numpy())
+        proba = model.predict_proba(x)
+        order = [list(model.classes_).index(c) for c in classes]  # reorder columns to `classes`
+        probabilities[run] = proba[:, order]
+    return probabilities
+
+
+def run_multiclass_models(
+    models: dict, whole: pd.DataFrame, tiles: pd.DataFrame, info: pd.DataFrame, classes: list[str]
+) -> dict[tuple[str, str], dict[int, pd.DataFrame]]:
+    """Run every multi-class model on whole pictures and on tiles; return image probabilities per run.
+
+    Args:
+        models (dict): name -> function that makes a new classifier, e.g. SUPERVISED_MODELS.
+        whole (pd.DataFrame): whole-picture features. tiles (pd.DataFrame): tile features.
+        info (pd.DataFrame): index = file, columns fold and label.
+        classes (list[str]): the labels to choose from, e.g. good + 10 defect types.
+
+    Returns:
+        dict: (model name, input) -> {run: DataFrame (index = file, columns = classes) of probabilities}.
+            Inputs: "whole"; "tiles mean" (average of the 12 tile probabilities); "tiles max" (for every
+            label its highest probability over the 12 tiles, which favours local defects).
+    """
+    results = {}
+    for name, make in tqdm(models.items(), desc="multi-class models"):
+        whole_p = multiclass_probabilities(whole, info, make, classes)
+        tile_p = multiclass_probabilities(tiles, info, make, classes)
+        results[(name, "whole")] = {
+            run: pd.DataFrame(p, index=whole["file"].to_numpy(), columns=classes) for run, p in whole_p.items()
+        }
+        for agg in ("mean", "max"):
+            results[(name, f"tiles {agg}")] = {
+                run: pd.DataFrame(p, columns=classes).groupby(tiles["file"].to_numpy()).agg(agg)
+                for run, p in tile_p.items()
+            }
+    return results
+
+
+def evaluate_multiclass(
+    probabilities: dict[int, pd.DataFrame], info: pd.DataFrame, classes: list[str]
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Evaluate the defect-type task (T2): the predicted label is the most likely one.
+
+    Args:
+        probabilities (dict[int, pd.DataFrame]): run -> probabilities (index = file, columns = classes).
+        info (pd.DataFrame): index = file, columns fold and label.
+        classes (list[str]): the labels, e.g. good + 10 defect types.
+
+    Returns:
+        tuple[pd.DataFrame, pd.DataFrame]:
+            metrics: one row per run, on the test fold (A-D images): accuracy, mean_recall (balanced
+                accuracy over the 11 labels), har (harmonic mean of the 11 recalls), group_accuracy
+                (right group: good / acquisition / preparation / field_position), and recall_<label>;
+            predictions: one row per image and run (test and test-only images): run, file, label,
+                predicted, role.
+    """
+    metric_rows, parts = [], []
+    for run, proba in probabilities.items():
+        roles = run_roles(info["fold"], run)
+        predicted = proba.idxmax(axis=1).reindex(info.index)
+        test = roles == "test"
+        truth, guess = info["label"][test], predicted[test]
+        recalls = {c: (guess[truth == c] == c).mean() for c in classes}
+        metric_rows.append({
+            "run": run,
+            "accuracy": (guess == truth).mean(),
+            "mean_recall": np.mean(list(recalls.values())),
+            "har": harmonic_mean(list(recalls.values())),
+            "group_accuracy": (guess.map(LABEL_GROUPS) == truth.map(LABEL_GROUPS)).mean(),
+            **{f"recall_{c}": r for c, r in recalls.items()},
+        })
+        shown = test | (roles == "test_only")
+        parts.append(pd.DataFrame({"run": run, "file": info.index[shown], "label": info["label"][shown].to_numpy(),
+                                   "predicted": predicted[shown].to_numpy(), "role": roles[shown].to_numpy()}))
+    return pd.DataFrame(metric_rows).set_index("run"), pd.concat(parts, ignore_index=True)
+
+
+def plot_confusion_matrix(predictions: pd.DataFrame, classes: list[str], extra_rows: list[str],
+                          title: str) -> plt.Figure:
+    """Draw the confusion matrix of the defect-type task, summed over the runs.
+
+    Args:
+        predictions (pd.DataFrame): from evaluate_multiclass (columns label, predicted, role).
+        classes (list[str]): the labels (rows and columns), e.g. good + 10 defect types.
+        extra_rows (list[str]): labels shown below the matrix, e.g. ["frozen", "uht"]: never trained on,
+            so their row only shows what the model calls them.
+        title (str): figure title.
+
+    Returns:
+        plt.Figure: rows = true label, columns = predicted label; each cell = % of the row (count below);
+            the diagonal = recognised correctly.
+    """
+    rows = classes + extra_rows
+    counts = pd.crosstab(predictions["label"], predictions["predicted"]).reindex(index=rows, columns=classes,
+                                                                                fill_value=0)
+    shares = counts.div(counts.sum(axis=1).replace(0, 1), axis=0) * 100
+    fig, ax = plt.subplots(figsize=(13, 0.62 * len(rows) + 2.5), constrained_layout=True)
+    ax.imshow(shares, cmap="Blues", vmin=0, vmax=100, aspect="auto")
+    for i in range(len(rows)):
+        for j in range(len(classes)):
+            if counts.iloc[i, j] > 0:
+                ax.text(j, i, f"{shares.iloc[i, j]:.0f}\n({counts.iloc[i, j]})", ha="center", va="center",
+                        fontsize=8, color="white" if shares.iloc[i, j] > 60 else "#0b0b0b")
+    ax.axhline(len(classes) - 0.5, color="#0b0b0b", lw=2)  # line between trained labels and extra rows
+    ax.set_xticks(range(len(classes)), classes, rotation=45, ha="right")
+    ax.set_yticks(range(len(rows)), rows)
+    ax.set(xlabel="predicted label", ylabel="true label",
+           title=f"{title}\n% of each row (count), all 4 runs; below the line: never trained on")
+    return fig
+
+
 # %% [markdown]
 # # Loading data
 
@@ -2330,6 +2463,54 @@ family_best = pd.concat([
                           ("supervised", data["SUPERVISED"])]
 ]).set_index("family")
 family_best[["method", "auroc", "balanced_accuracy", "har", "false_alarms_pct"] + eval_labels[1:]].round(2)
+
+# %% [markdown]
+# ## Supervised models (defect type)
+#
+# Task T2: not only "good or defective?" but **which problem**. The same four supervised models and
+# 95 features, trained on the training folds, now choose **one of 11 labels** (good + the 10 defect
+# types); the predicted label is simply the most likely one (no 95 % cut). Inputs: the whole picture;
+# **tiles mean** (average of the 12 tiles' label probabilities); **tiles max** (for every label its
+# highest probability over the 12 tiles, which helps local defects such as bubbles).
+#
+# Result: a table (accuracy, mean recall over the 11 labels, HAR, right group = good / acquisition /
+# preparation / field position) and the **confusion matrix** of the best model: rows = true label,
+# columns = predicted label, summed over the 4 runs. Frozen and UHT were never trained on, so their rows
+# (below the line) only show what the model calls them.
+
+# %%
+t2_classes = [label for label in eval_labels if label not in ("frozen", "uht")]  # good + 10 defect types
+t2_probabilities = load_or_compute(
+    CACHE_DIR / "multiclass_probabilities.pkl",
+    lambda: run_multiclass_models(SUPERVISED_MODELS, data["WHOLE_FEATURES"], data["TILE_FEATURES"], eval_info,
+                                  t2_classes),
+    USE_SAVED_RESULTS,
+)
+t2_results = {key: evaluate_multiclass(p, eval_info, t2_classes) for key, p in t2_probabilities.items()}
+data["DEFECT_TYPE"] = pd.DataFrame([
+    {"method": f"{name} | {input_name}",
+     **{m: metrics[m].mean() for m in ["accuracy", "mean_recall", "har", "group_accuracy"]},
+     "mean_recall_sd": metrics["mean_recall"].std()}
+    for (name, input_name), (metrics, _) in t2_results.items()
+])
+save_table(data["DEFECT_TYPE"].round(4), RESULTS_DIR / "defect_type_summary.csv", OVERWRITE)
+data["DEFECT_TYPE"].sort_values("mean_recall", ascending=False).round(3)
+
+# %%
+# Confusion matrix of the best model (highest mean recall over the 11 labels)
+best_t2 = data["DEFECT_TYPE"].sort_values("mean_recall", ascending=False)["method"].iloc[0]
+fig = plot_confusion_matrix(t2_results[tuple(best_t2.split(" | "))][1], t2_classes, ["frozen", "uht"],
+                            f"Defect type, best model: {best_t2}")
+save_figure(fig, RESULTS_DIR / "defect_type_confusion.png", OVERWRITE)
+plt.show()
+
+# %%
+# Recall per label of the best model (mean and SD over the 4 runs)
+best_t2_metrics = t2_results[tuple(best_t2.split(" | "))][0]
+pd.DataFrame({
+    "recall_pct_mean": 100 * best_t2_metrics[[f"recall_{c}" for c in t2_classes]].mean().to_numpy(),
+    "recall_pct_sd": 100 * best_t2_metrics[[f"recall_{c}" for c in t2_classes]].std().to_numpy(),
+}, index=t2_classes).round(1)
 
 # %% [markdown]
 # # Experiments
