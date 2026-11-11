@@ -19,6 +19,11 @@
 
 # %%
 import os
+
+# Pretrained network weights are downloaded into the project (git-ignored), not into ~/.cache
+os.environ["HF_HOME"] = "/home/qq/mfg_qc/data/weights/huggingface"
+os.environ["TORCH_HOME"] = "/home/qq/mfg_qc/data/weights/torch"
+
 import pickle
 import shutil
 import time
@@ -31,18 +36,21 @@ import cv2
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import timm
+import torch
+from lightgbm import LGBMClassifier
 from matplotlib.patches import Rectangle
 from skimage.feature import local_binary_pattern
 from skimage.filters import threshold_otsu
 from sklearn.covariance import LedoitWolf
-from lightgbm import LGBMClassifier
 from sklearn.ensemble import HistGradientBoostingClassifier, IsolationForest, RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
-from sklearn.pipeline import make_pipeline
 from sklearn.metrics import roc_auc_score, roc_curve
 from sklearn.neighbors import LocalOutlierFactor
+from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import OneClassSVM
+from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 # %%
@@ -211,6 +219,16 @@ SUPERVISED_MODELS = {
     "HistGradientBoosting": lambda: HistGradientBoostingClassifier(class_weight="balanced", random_state=SEED),
     "LightGBM": lambda: LGBMClassifier(class_weight="balanced", n_jobs=DATA_WORKERS, random_state=SEED, verbose=-1),
 }
+
+# Deep features: pretrained networks (no training) turn every tile and whole picture into numbers
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+DEEP_BACKBONES = {  # short name -> timm model name
+    "resnet18": "resnet18.a1_in1k",               # ImageNet CNN; last two stages, averaged: 256 + 512 values
+    # Later (about 2 h on the GTX 1650, resumable in chunks of 200 images), e.g. overnight:
+    # "dinov2_vits14": "vit_small_patch14_dinov2.lvd142m",  # self-supervised ViT; summary + mean patch token: 384 + 384
+}
+DEEP_FEATURES_DIR = Path("/home/qq/mfg_qc/data/features/deep")  # saved chunks per backbone (git-ignored)
+DEEP_BATCH_IMAGES = 4  # images per GPU batch (each = 12 tiles + 1 whole picture)
 
 data = {}
 
@@ -1535,6 +1553,132 @@ def plot_confusion_matrix(predictions: pd.DataFrame, classes: list[str], extra_r
     return fig
 
 
+class ModelInputs(Dataset):
+    """For every image: its 12 tiles and its whole picture, as uint8 arrays (read in parallel workers).
+
+    Args:
+        paths (list[Path]): image files, e.g. the 3,966 images that are not excluded.
+        roi (tuple[int, int, int, int]): (x0, y0, x1, y1) of the ROI in px, e.g. ROI.
+        tile (int): tile side in px, e.g. 384.
+        whole_size (tuple[int, int]): whole-picture (width, height) in px, e.g. (768, 576).
+
+    Returns (per item):
+        tuple[np.ndarray, np.ndarray]: tiles of shape (12, 384, 384, 3) and the whole picture of shape
+            (576, 768, 3), RGB uint8.
+    """
+
+    def __init__(self, paths: list[Path], roi: tuple[int, int, int, int], tile: int, whole_size: tuple[int, int]):
+        self.paths, self.roi, self.tile, self.whole_size = paths, roi, tile, whole_size
+
+    def __len__(self) -> int:
+        return len(self.paths)
+
+    def __getitem__(self, i: int) -> tuple[np.ndarray, np.ndarray]:
+        roi_img = load_roi(self.paths[i], self.roi)
+        return cut_tiles(roi_img, self.tile), shrink_roi(roi_img, self.whole_size)
+
+
+def make_backbone(timm_name: str) -> torch.nn.Module:
+    """Load a pretrained network from timm (downloaded once into data/weights) for feature extraction.
+
+    Args:
+        timm_name (str): e.g. "resnet18.a1_in1k" or "vit_small_patch14_dinov2.lvd142m".
+
+    Returns:
+        torch.nn.Module: the network in eval mode on DEVICE. CNNs return their feature maps of the last
+            two stages; ViTs accept any input size divisible by the patch size.
+    """
+    if "vit" in timm_name:
+        model = timm.create_model(timm_name, pretrained=True, num_classes=0, dynamic_img_size=True)
+    else:
+        model = timm.create_model(timm_name, pretrained=True, features_only=True, out_indices=(3, 4))
+    return model.eval().to(DEVICE)
+
+
+def backbone_features(model: torch.nn.Module, images: torch.Tensor) -> torch.Tensor:
+    """Return one feature vector per image from a pretrained network (no training, no gradients).
+
+    Args:
+        model (torch.nn.Module): from make_backbone.
+        images (torch.Tensor): uint8 batch on DEVICE, shape (n, height, width, 3), RGB.
+
+    Returns:
+        torch.Tensor: float32, shape (n, 768). CNN: the last two feature maps averaged over the image
+            and concatenated. ViT (patch 14): the image is centre-cropped to a multiple of 14 px (no
+            resizing), then the summary (CLS) token and the mean of the patch tokens are concatenated.
+    """
+    config = model.pretrained_cfg
+    mean = torch.tensor(config["mean"], device=DEVICE).view(1, 3, 1, 1)
+    std = torch.tensor(config["std"], device=DEVICE).view(1, 3, 1, 1)
+    x = (images.permute(0, 3, 1, 2).float() / 255 - mean) / std  # (n, 3, h, w), normalised like ImageNet
+    is_vit = hasattr(model, "patch_embed")
+    # Half precision only for the ViT: the CNN's internal values overflow fp16 (NaN), so it runs in fp32
+    with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.float16,
+                                                enabled=is_vit and DEVICE == "cuda"):
+        if is_vit:
+            patch = model.patch_embed.patch_size[0]
+            h, w = x.shape[2] // patch * patch, x.shape[3] // patch * patch
+            top, left = (x.shape[2] - h) // 2, (x.shape[3] - w) // 2
+            tokens = model.forward_features(x[:, :, top:top + h, left:left + w])
+            features = torch.cat([tokens[:, 0], tokens[:, model.num_prefix_tokens:].mean(dim=1)], dim=1)
+        else:  # CNN
+            maps = model(x)
+            features = torch.cat([m.mean(dim=(2, 3)) for m in maps], dim=1)
+    features = features.float()
+    if not torch.isfinite(features).all():
+        raise ValueError("Non-finite deep features (NaN or inf)")
+    return features
+
+
+def extract_deep_features(paths: list[Path], timm_name: str, batch_images: int, workers: int,
+                          parts_dir: Path, use_saved: bool, chunk: int = 200) -> dict:
+    """Compute the deep features of every tile and whole picture with one pretrained network.
+
+    Resumable: the images are processed in chunks of `chunk` images; every finished chunk is saved in
+    parts_dir and, with use_saved = True, skipped when the function is run again (e.g. after an
+    interruption). The saved chunks are the saved result (no extra copy).
+
+    Args:
+        paths (list[Path]): image files, e.g. the 3,966 images that are not excluded.
+        timm_name (str): e.g. "vit_small_patch14_dinov2.lvd142m".
+        batch_images (int): images per GPU batch, e.g. 4 (= 48 tiles + 4 whole pictures).
+        workers (int): processes that read the images, e.g. DATA_WORKERS.
+        parts_dir (Path): folder for the finished chunks, e.g. DEEP_FEATURES_DIR / "dinov2_vits14_parts".
+        use_saved (bool): True = reuse finished chunks (e.g. USE_SAVED_RESULTS); False = recompute all
+            chunks and replace them.
+        chunk (int): images per saved chunk, e.g. 200.
+
+    Returns:
+        dict: "files" (list[str], file names), "tiles" (np.ndarray float32 of shape (n, 12, 768)),
+            "whole" (np.ndarray float32 of shape (n, 768)).
+    """
+    parts_dir.mkdir(parents=True, exist_ok=True)
+    starts = list(range(0, len(paths), chunk))
+    todo = [s for s in starts if not (use_saved and (parts_dir / f"part_{s:05d}.npz").exists())]
+    if todo:
+        model = make_backbone(timm_name)
+        progress = tqdm(total=sum(len(paths[s:s + chunk]) for s in todo), desc=timm_name.split(".")[0], unit="image")
+        for start in todo:
+            loader = DataLoader(ModelInputs(paths[start:start + chunk], ROI, CROP_SIZE, WHOLE_SIZE),
+                                batch_size=batch_images, num_workers=workers)
+            tile_parts, whole_parts = [], []
+            for tiles, whole in loader:
+                n = tiles.shape[0]
+                tile_feats = backbone_features(model, tiles.to(DEVICE).flatten(0, 1))  # (n * 12, 768)
+                tile_parts.append(tile_feats.view(n, -1, tile_feats.shape[1]).cpu().numpy())
+                whole_parts.append(backbone_features(model, whole.to(DEVICE)).cpu().numpy())
+                progress.update(n)
+            np.savez(parts_dir / f"part_{start:05d}.npz", tiles=np.concatenate(tile_parts),
+                     whole=np.concatenate(whole_parts))
+        progress.close()
+        del model
+        torch.cuda.empty_cache()
+    parts = [np.load(parts_dir / f"part_{s:05d}.npz") for s in starts]
+    return {"files": [p.name for p in paths],
+            "tiles": np.concatenate([p["tiles"] for p in parts]),
+            "whole": np.concatenate([p["whole"] for p in parts])}
+
+
 # %% [markdown]
 # # Loading data
 
@@ -2511,6 +2655,33 @@ pd.DataFrame({
     "recall_pct_mean": 100 * best_t2_metrics[[f"recall_{c}" for c in t2_classes]].mean().to_numpy(),
     "recall_pct_sd": 100 * best_t2_metrics[[f"recall_{c}" for c in t2_classes]].std().to_numpy(),
 }, index=t2_classes).round(1)
+
+# %% [markdown]
+# # Deep features
+#
+# Pretrained networks turn every tile and every whole picture into 768 numbers ("deep features"),
+# much richer than the 95 handcrafted features. The networks are not trained here, they only "look":
+# - **ResNet-18** (trained on ImageNet photos): the feature maps of its last two stages, averaged;
+# - **DINOv2 ViT-S/14** (self-supervised on 142 million images): its summary token and the average of
+#   its patch tokens. It needs sizes divisible by 14, so tiles are centre-cropped to 378 x 378 px and
+#   whole pictures to 756 x 574 px (cropping, no resizing).
+#
+# The features then go into the same one-class and supervised models as the handcrafted features.
+
+# %% [markdown]
+# ## Feature extraction
+
+# %%
+images_used = data["TILES"].drop_duplicates("file")
+deep_features = {  # resumable: finished chunks of 200 images are saved and reused
+    name: extract_deep_features([Path(p) for p in images_used["path"]], timm_name, DEEP_BATCH_IMAGES,
+                                DATA_WORKERS, DEEP_FEATURES_DIR / f"{name}_parts", USE_SAVED_RESULTS)
+    for name, timm_name in DEEP_BACKBONES.items()
+}
+pd.DataFrame({
+    name: {"images": len(f["files"]), "tile features": f["tiles"].shape, "whole-picture features": f["whole"].shape}
+    for name, f in deep_features.items()
+}).T
 
 # %% [markdown]
 # # Experiments
