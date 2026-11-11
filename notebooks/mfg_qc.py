@@ -2209,3 +2209,50 @@ plt.show()
 
 # %% [markdown]
 # # Experiments
+
+# %% [markdown]
+# ## PyOD detectors (curiosity, not for the paper)
+#
+# Five more one-class detectors from the PyOD library, run exactly like the scikit-learn ones
+# (all 95 features, good training images only, same evaluation), to see whether any of them beats
+# the final one-class models:
+# - **ECOD** and **COPOD**: for every feature, how far into the tail of the good distribution a value
+#   lies, combined over all features; no settings at all;
+# - **HBOS**: a histogram of every feature from the good images; rare bins = unusual;
+# - **KNN**: distance to the 20th nearest good image;
+# - **PCA**: how badly the image is described by the main patterns of the good images.
+
+# %%
+# Temporary experiment: the PyOD imports are kept here so the whole experiment can be removed in one piece
+from pyod.models.copod import COPOD
+from pyod.models.ecod import ECOD
+from pyod.models.hbos import HBOS
+from pyod.models.knn import KNN
+from pyod.models.pca import PCA as PyodPCA
+
+pyod_detectors = {
+    "ECOD": lambda: ECOD(),
+    "COPOD": lambda: COPOD(),
+    "HBOS": lambda: HBOS(),
+    "KNN": lambda: KNN(n_neighbors=20),
+    # keep the main patterns (99 % of the variation): the histogram bins sum to 1, so the last
+    # patterns have ~0 variance and PCA's score (divided by that variance) would explode
+    "PCA": lambda: PyodPCA(n_components=0.99, svd_solver="full", random_state=SEED),
+}
+pyod_image_scores = load_or_compute(
+    CACHE_DIR / "pyod_scores.pkl",
+    lambda: run_one_class_detectors(pyod_detectors, data["WHOLE_FEATURES"], data["TILE_FEATURES"], eval_info),
+    USE_SAVED_RESULTS,
+)
+pyod_summary = pd.DataFrame([
+    summary_row(f"PyOD {name} | {input_name}", *evaluate_method(scores, eval_info, two_sided=False), eval_labels)
+    for (name, input_name), scores in pyod_image_scores.items()
+])
+print("PyOD detectors next to the final scikit-learn one-class models, sorted by AUROC:")
+pd.concat([data["ONE_CLASS"], pyod_summary]).sort_values("auroc", ascending=False)[
+    ["method", "auroc", "auroc_sd", "balanced_accuracy", "har", "false_alarms_pct", "false_alarms_sd_pct"]
+].round(3)
+
+# %%
+fig = plot_detection_heatmap(pyod_summary, eval_labels, "Experiment: PyOD one-class detectors on all 95 features")
+plt.show()
