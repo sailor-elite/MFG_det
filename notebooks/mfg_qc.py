@@ -33,6 +33,7 @@ import pandas as pd
 from matplotlib.patches import Rectangle
 from skimage.feature import local_binary_pattern
 from skimage.filters import threshold_otsu
+from sklearn.metrics import roc_auc_score, roc_curve
 from tqdm import tqdm
 
 # %%
@@ -175,6 +176,8 @@ FOLDS = {
 # Evaluation runs: test on fold k, choose thresholds and settings on the next fold (cyclic),
 # train on the other two. F and U (no fold) are tested in every run.
 VALIDATION_FOLD = {k: k % len(FOLDS) + 1 for k in FOLDS}  # {1: 2, 2: 3, 3: 4, 4: 1}
+FLAG_PERCENTILE = 95  # flag an image when it is more unusual than 95 % of good validation images
+RUN_COLOURS = {1: "#2a78d6", 2: "#eb6834", 3: "#1baf7a", 4: "#eda100"}  # one colour per run in figures
 
 data = {}
 
@@ -921,6 +924,202 @@ def run_roles(folds: pd.Series, test_fold: int) -> pd.Series:
     return roles
 
 
+def unusualness(scores: np.ndarray, good_val_scores: np.ndarray, two_sided: bool) -> np.ndarray:
+    """Return how unusual every score is compared with the good validation images, from 0 to 100.
+
+    p = percentile of the score among the good validation scores (share of them below it, in %;
+    ties count half). One-sided (higher score = more defective): u = p. Two-sided (a defect can push
+    the score either way): u = 2 * |p - 50|, so u > 95 means p < 2.5 or p > 97.5.
+    Either way, about 5 % of good images get u > 95.
+
+    Args:
+        scores (np.ndarray): the score of every image, e.g. VoL, shape (n,).
+        good_val_scores (np.ndarray): the scores of the good validation images, e.g. shape (156,).
+        two_sided (bool): True for single features, False for "higher = more defective" scores.
+
+    Returns:
+        np.ndarray: float array of shape (n,) with values 0-100; above FLAG_PERCENTILE = flagged.
+    """
+    ref = np.sort(np.asarray(good_val_scores, dtype=float))
+    s = np.asarray(scores, dtype=float)
+    below = np.searchsorted(ref, s, side="left")      # good scores strictly below
+    below_or_equal = np.searchsorted(ref, s, side="right")
+    p = 100 * (below + below_or_equal) / (2 * len(ref))
+    return 2 * np.abs(p - 50) if two_sided else p
+
+
+def harmonic_mean(values: list[float]) -> float:
+    """Return the harmonic mean, e.g. of recalls (HAR); 0 if any value is 0.
+
+    Args:
+        values (list[float]): e.g. [specificity, sensitivity] = [0.95, 0.80].
+
+    Returns:
+        float: n / sum(1 / v), e.g. 0.869 for [0.95, 0.80].
+    """
+    return 0.0 if min(values) <= 0 else len(values) / sum(1 / v for v in values)
+
+
+def evaluate_method(
+    scores: pd.DataFrame, info: pd.DataFrame, two_sided: bool
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Evaluate one method in all runs with the common rules (percentile of good validation, 95 % cut).
+
+    Args:
+        scores (pd.DataFrame): index = file, one column per run (1-4): the method's score of every
+            image in that run (for scores that need no training, the same column 4 times).
+        info (pd.DataFrame): index = file (images that are not excluded), columns fold, label, is_defect.
+        two_sided (bool): True for single features (a defect can move them either way).
+
+    Returns:
+        tuple[pd.DataFrame, pd.DataFrame]:
+            metrics: one row per run, on the test fold (A-D images): auroc, balanced_accuracy,
+                har (harmonic mean of the good and defect recall), false_alarms_good,
+                detected_defects; plus detected_frozen and detected_uht (test-only images);
+            predictions: one row per image and run (test and test-only images): run, file, label,
+                is_defect, role ("test" or "test_only"), score, unusualness, flagged, and
+                ranking_score (what AUROC uses: the raw score, or for two-sided scores u with ties
+                at 0/100 broken by the distance from the good median).
+    """
+    metric_rows, prediction_parts = [], []
+    defect = info["is_defect"].astype(bool)
+    for run in scores.columns:
+        roles = run_roles(info["fold"], run)
+        s = scores[run].reindex(info.index)
+        good_val = s[(roles == "validation") & (info["label"] == "good")]
+        u = pd.Series(unusualness(s, good_val, two_sided), index=info.index)
+        flagged = u > FLAG_PERCENTILE
+        if two_sided:
+            # For AUROC / ROC only: images beyond the range of the good validation images all get
+            # u = 100 (ties); break the ties by the distance from the good median (in IQRs). The
+            # added amount is < 0.1, smaller than one step of u, so it never changes the order of
+            # different u values nor any decision.
+            spread = good_val.quantile(0.75) - good_val.quantile(0.25)
+            distance = (s - good_val.median()).abs() / spread
+            ranking = u + 0.1 * distance / (1 + distance)
+        else:
+            ranking = s  # higher = more defective already, no ties from the percentile scale
+
+        test, test_only = roles == "test", roles == "test_only"
+        detected = flagged[test & defect].mean()          # sensitivity
+        passed_good = 1 - flagged[test & ~defect].mean()  # specificity
+        metric_rows.append({
+            "run": run,
+            # AUROC needs no threshold: on the raw score, or on u (ties broken) for two-sided scores
+            "auroc": roc_auc_score(defect[test], ranking[test]),
+            "balanced_accuracy": (detected + passed_good) / 2,
+            "har": harmonic_mean([passed_good, detected]),
+            "false_alarms_good": 1 - passed_good,
+            "detected_defects": detected,
+            "detected_frozen": flagged[test_only & (info["label"] == "frozen")].mean(),
+            "detected_uht": flagged[test_only & (info["label"] == "uht")].mean(),
+        })
+        shown = test | test_only
+        prediction_parts.append(pd.DataFrame({
+            "run": run, "file": info.index[shown], "label": info["label"][shown].to_numpy(),
+            "is_defect": defect[shown].to_numpy(), "role": roles[shown].to_numpy(),
+            "score": s[shown].to_numpy(), "unusualness": u[shown].to_numpy(),
+            "flagged": flagged[shown].to_numpy(),
+            "ranking_score": ranking[shown].to_numpy(),
+        }))
+    return pd.DataFrame(metric_rows).set_index("run"), pd.concat(prediction_parts, ignore_index=True)
+
+
+def detection_table(predictions: pd.DataFrame, label_order: list[str]) -> pd.DataFrame:
+    """Return the detection table: how often every label was flagged, as mean and SD over the runs.
+
+    Args:
+        predictions (pd.DataFrame): from evaluate_method (columns run, file, label, flagged).
+        label_order (list[str]): labels from top to bottom, e.g. ["good", "blur_light", ...].
+
+    Returns:
+        pd.DataFrame: one row per label with should_be ("passed" for good, else "flagged"),
+            images (number of different images), flagged_pct_mean and flagged_pct_sd over the runs.
+            For good, flagged_pct is the false-alarm rate; for the others, the detection rate.
+    """
+    per_run = predictions.groupby(["label", "run"])["flagged"].mean().unstack("run") * 100
+    table = pd.DataFrame({
+        "should_be": ["passed" if label == "good" else "flagged" for label in label_order],
+        "images": predictions.groupby("label")["file"].nunique().reindex(label_order),
+        "flagged_pct_mean": per_run.mean(axis=1).reindex(label_order),
+        "flagged_pct_sd": per_run.std(axis=1).reindex(label_order),
+    }, index=label_order)
+    return table.round(1)
+
+
+def plot_evaluation(
+    metrics: pd.DataFrame, predictions: pd.DataFrame, label_order: list[str], title: str
+) -> plt.Figure:
+    """Draw the result of one method: ROC curves, confusion matrix and detection rate per label.
+
+    Args:
+        metrics (pd.DataFrame): from evaluate_method (one row per run; column auroc).
+        predictions (pd.DataFrame): from evaluate_method (columns run, label, is_defect, role,
+            flagged, ranking_score).
+        label_order (list[str]): labels from top to bottom in the bar chart, e.g. ["good", ...].
+        title (str): name of the method, e.g. "VoL of the whole picture (two-sided)".
+
+    Returns:
+        plt.Figure: three panels:
+            1. ROC curve of every run (test fold, A-D images) with its AUROC; the dot is the
+               95th-percentile cut (false alarms on good vs share of defects detected);
+            2. confusion matrix good/defective x passed/flagged, summed over the 4 runs;
+            3. share of flagged images per label (mean +- SD over the runs); for good this is the
+               false-alarm rate, the dashed line is the 5 % target.
+    """
+    fig, (ax_roc, ax_cm, ax_det) = plt.subplots(
+        1, 3, figsize=(21, 6.5), constrained_layout=True, gridspec_kw={"width_ratios": [1, 0.8, 1.2]}
+    )
+    test = predictions[predictions["role"] == "test"]
+
+    # 1. ROC curves, one per run
+    for run, d in test.groupby("run"):
+        fpr, tpr, _ = roc_curve(d["is_defect"], d["ranking_score"])
+        ax_roc.plot(fpr, tpr, color=RUN_COLOURS[run], lw=2, label=f"run {run}: AUROC {metrics.loc[run, 'auroc']:.2f}")
+        ax_roc.plot(d.loc[~d["is_defect"], "flagged"].mean(), d.loc[d["is_defect"], "flagged"].mean(), "o",
+                    color=RUN_COLOURS[run], ms=9, mec="white", mew=2)
+    ax_roc.plot([0, 1], [0, 1], ls="--", lw=1, color=REFERENCE_COLOUR)
+    ax_roc.set(xlabel="false alarms on good (false-positive rate)", ylabel="defects detected (true-positive rate)",
+               title="ROC curve per run (dot = 95th-percentile cut)", xlim=(0, 1), ylim=(0, 1.01))
+    ax_roc.legend(loc="lower right", frameon=False)
+
+    # 2. Confusion matrix, summed over the runs (every A-D image is tested once)
+    truth = test["is_defect"].map({False: "good", True: "defective"})
+    decision = test["flagged"].map({False: "passed", True: "flagged"})
+    counts = pd.crosstab(truth, decision).reindex(index=["good", "defective"], columns=["passed", "flagged"],
+                                                  fill_value=0)
+    shares = counts.div(counts.sum(axis=1), axis=0)
+    ax_cm.imshow(shares, cmap="Blues", vmin=0, vmax=1)
+    for i in range(2):
+        for j in range(2):
+            ax_cm.text(j, i, f"{counts.iloc[i, j]}\n({100 * shares.iloc[i, j]:.0f} %)", ha="center", va="center",
+                       fontsize=13, color="white" if shares.iloc[i, j] > 0.5 else "#0b0b0b")
+    ax_cm.set_xticks([0, 1], ["passed", "flagged"])
+    ax_cm.set_yticks([0, 1], ["good", "defective"])
+    ax_cm.set(xlabel="decision", ylabel="true label", title="Confusion matrix (all 4 runs, test images A-D)")
+
+    # 3. Share flagged per label
+    table = detection_table(predictions, label_order)
+    colours = [REFERENCE_COLOUR if label == "good" else SERIES_COLOUR for label in label_order]
+    mean_pct, sd_pct = table["flagged_pct_mean"].fillna(0), table["flagged_pct_sd"].fillna(0)
+    err_low, err_high = np.minimum(sd_pct, mean_pct), np.minimum(sd_pct, 100 - mean_pct)  # stay in 0-100 %
+    ax_det.barh(label_order, mean_pct, xerr=[err_low, err_high], color=colours,
+                error_kw=dict(ecolor="#52514e", lw=1, capsize=3))
+    for y, (value, high) in enumerate(zip(mean_pct, err_high)):
+        ax_det.text(value + high + 2, y, f"{value:.0f} %", va="center", fontsize=9)  # right of the error bar
+    ax_det.axvline(100 - FLAG_PERCENTILE, ls="--", lw=1, color=REFERENCE_COLOUR)
+    ax_det.invert_yaxis()
+    ax_det.set(xlim=(0, 115), xlabel="flagged [%] (mean ± SD over runs)",
+               title="Flagged per label (good = false alarms; dashed = 5 % target)")
+    ax_det.spines[["top", "right"]].set_visible(False)
+
+    mean = metrics.mean()
+    fig.suptitle(f"{title}:  AUROC {mean['auroc']:.2f},  balanced accuracy {mean['balanced_accuracy']:.2f},  "
+                 f"HAR {mean['har']:.2f},  false alarms on good {100 * mean['false_alarms_good']:.0f} %  "
+                 "(mean over 4 runs)", fontsize=13)
+    return fig
+
+
 # %% [markdown]
 # # Loading data
 
@@ -1364,6 +1563,36 @@ checks = {
     ),
 }
 pd.Series(checks, name="ok")
+
+# %% [markdown]
+# ## Plain variance of the Laplacian
+#
+# The evaluation tried on the simplest possible detector, before it is used for all methods:
+# **"an image is defective if its variance of the Laplacian (VoL, sharpness of the whole picture) is
+# unusual compared with good images"**. Nothing is trained. In every run:
+# 1. the VoL of the good images of the validation fold shows what "normal" is;
+# 2. a test image is flagged as defective if its VoL is below the 2.5th or above the 97.5th
+#    percentile of them (two-sided: blur lowers VoL, undiluted raises it);
+# 3. the decisions are compared with the true labels.
+#
+# Result: the metrics per run (table) and the figure (ROC curves, confusion matrix, flagged per label).
+
+# %%
+eval_info = data["MANIFEST"].loc[~data["MANIFEST"]["excluded"]].set_index("file")[["fold", "label", "is_defect"]]
+eval_labels = list(data["PICTURES_BY_LABEL"])  # good, blur_light, ..., frozen, uht
+demo_vol = pd.read_csv(WHOLE_FEATURES_CSV, usecols=["file", "vol"]).set_index("file")["vol"]
+demo_metrics, demo_predictions = evaluate_method(
+    pd.DataFrame({run: demo_vol for run in FOLDS}), eval_info, two_sided=True
+)
+demo_summary = pd.concat([demo_metrics, demo_metrics.agg(["mean", "std"])])
+demo_summary.index = [f"run {run}" for run in demo_metrics.index] + ["mean", "SD"]
+demo_summary.round(3)
+
+# %%
+fig = plot_evaluation(demo_metrics, demo_predictions, eval_labels,
+                      "Plain variance of the Laplacian (whole picture, two-sided)")
+save_figure(fig, RESULTS_DIR / "evaluation_example_vol.png", OVERWRITE)
+plt.show()
 
 # %% [markdown]
 # # Classical methods
