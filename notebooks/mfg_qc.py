@@ -19,6 +19,7 @@
 
 # %%
 import os
+import pickle
 import shutil
 import time
 from concurrent.futures import ProcessPoolExecutor
@@ -43,6 +44,10 @@ EXCLUDED_CSV = Path("/home/qq/mfg_qc/data/excluded_images.csv")  # images remove
 MANIFEST_CSV = Path("/home/qq/mfg_qc/data/manifest.csv")  # one row per raw image (labels, preps, folds)
 RESULTS_DIR = Path("/home/qq/mfg_qc/results")  # figures and tables (also for the paper)
 OVERWRITE = False  # False = never overwrite files that already exist in RESULTS_DIR
+USE_SAVED_RESULTS = True  # True: slow cells load their saved results (compute only what is not saved yet);
+                          # False: recompute all slow cells and replace their saved results
+                          # (set False after changing the data or settings, e.g. new exclusions)
+CACHE_DIR = Path("/home/qq/mfg_qc/data/cache")  # saved results of slow cells (git-ignored)
 SEED = 0           # random seed for everything
 
 # ROI (CLAUDE.md §9 Step 1) and tiles (Step 2)
@@ -574,6 +579,33 @@ def measure_load_times(
             "decode_tile_pngs": (t6 - t5) * 1000,
         })
     return pd.DataFrame(rows)
+
+
+def load_or_compute(path: Path, compute, use_saved: bool):
+    """Return the saved result of a slow cell, or compute it, save it and return it.
+
+    Args:
+        path (Path): file of the saved result, e.g. CACHE_DIR / "sharpness_map.pkl".
+        compute (callable): function without arguments that computes the result,
+            e.g. lambda: np.mean([...], axis=0).
+        use_saved (bool): True = load the saved file if it exists (e.g. USE_SAVED_RESULTS);
+            False = always compute and replace the saved file.
+
+    Returns:
+        object: the result (any Python object: array, table, list, ...).
+    """
+    if use_saved and path.exists():
+        with open(path, "rb") as f:
+            result = pickle.load(f)
+        print(f"Loaded saved result: {path.name}")
+        return result
+    t0 = time.time()
+    result = compute()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "wb") as f:
+        pickle.dump(result, f)
+    print(f"Computed in {time.time() - t0:.0f} s and saved: {path.name}")
+    return result
 
 
 def save_figure(fig: plt.Figure, path: Path, overwrite: bool, dpi: int = 100) -> None:
@@ -1250,7 +1282,11 @@ print(len(excluded_names), "images excluded")
 
 # %%
 # Copy the raw images to MFG_DIR/<label>/ (about 38 GB; files that already exist are skipped)
-copy_summary = copy_pictures_by_label(data["PICTURES_BY_LABEL"], MFG_DIR, overwrite=False)
+copy_summary = load_or_compute(
+    CACHE_DIR / "copy_summary.pkl",
+    lambda: copy_pictures_by_label(data["PICTURES_BY_LABEL"], MFG_DIR, overwrite=False),
+    USE_SAVED_RESULTS,
+)
 copy_summary
 
 # %%
@@ -1327,7 +1363,12 @@ else:
 data["ROI_IMAGES"] = data["PICTURES_BY_LABEL"]["good"]
 
 # Average sharpness map, relative to the centre of the frame
-mean_map = np.mean([sharpness_map(p, SHARP_TILE) for p in data["ROI_IMAGES"]], axis=0)
+mean_map = load_or_compute(
+    CACHE_DIR / "sharpness_map.pkl",
+    lambda: np.mean([sharpness_map(p, SHARP_TILE) for p in tqdm(data["ROI_IMAGES"], desc="sharpness map")],
+                    axis=0),
+    USE_SAVED_RESULTS,
+)
 rows, cols = mean_map.shape  # (24, 32)
 centre = mean_map[rows // 2 - 2:rows // 2 + 2, cols // 2 - 2:cols // 2 + 2].mean()
 data["SHARPNESS_MAP"] = mean_map / centre
@@ -1569,7 +1610,11 @@ plt.show()
 rng = np.random.default_rng(SEED)
 images_used = data["TILES"].drop_duplicates("file")  # one row per image that is not excluded
 speed_sample = images_used.iloc[sorted(rng.choice(len(images_used), SPEED_TEST_IMAGES, replace=False))]
-load_times = measure_load_times([Path(p) for p in speed_sample["path"]], ROI, CROP_SIZE, WHOLE_SIZE)
+load_times = load_or_compute(
+    CACHE_DIR / "load_times.pkl",
+    lambda: measure_load_times([Path(p) for p in speed_sample["path"]], ROI, CROP_SIZE, WHOLE_SIZE),
+    USE_SAVED_RESULTS,
+)
 load_times.agg(["mean", "median", "max"]).T.round(1).rename_axis("ms per image")
 
 # %%
@@ -1780,10 +1825,14 @@ plt.show()
 # %%
 # Globule thresholds t: Otsu's method on D of ALL good tiles, and separately of all good whole pictures
 good_paths = [Path(p) for p in data["TILES"].loc[data["TILES"]["label"] == "good", "path"].unique()]
-counts = run_parallel(
-    partial(deviation_counts, roi=ROI, tile=CROP_SIZE, whole_size=WHOLE_SIZE,
-            sigma_tile=GLOBULE_BLUR_SIGMA, sigma_whole=GLOBULE_BLUR_SIGMA_WHOLE),
-    good_paths, DATA_WORKERS, desc="D of good images",
+counts = load_or_compute(
+    CACHE_DIR / "globule_deviation_counts.pkl",
+    lambda: run_parallel(
+        partial(deviation_counts, roi=ROI, tile=CROP_SIZE, whole_size=WHOLE_SIZE,
+                sigma_tile=GLOBULE_BLUR_SIGMA, sigma_whole=GLOBULE_BLUR_SIGMA_WHOLE),
+        good_paths, DATA_WORKERS, desc="D of good images",
+    ),
+    USE_SAVED_RESULTS,
 )
 bin_centres = np.arange(256) + 0.5
 data["GLOBULE_THRESHOLD"] = float(threshold_otsu(hist=(sum(c[0] for c in counts), bin_centres)))
@@ -1874,10 +1923,10 @@ plt.show()
 # The 95 features for every tile (12 per image, full resolution) and for every whole picture
 # (the ROI scaled to 768 x 576 px), for all 3,966 images that are not excluded. Computed once in
 # `DATA_WORKERS` parallel processes (about 10-15 min) and saved to `data/features/`; later runs only
-# read the files (unless `OVERWRITE = True`).
+# read the files (unless `USE_SAVED_RESULTS = False`).
 
 # %%
-if TILE_FEATURES_CSV.exists() and WHOLE_FEATURES_CSV.exists() and not OVERWRITE:
+if TILE_FEATURES_CSV.exists() and WHOLE_FEATURES_CSV.exists() and USE_SAVED_RESULTS:
     data["TILE_FEATURES"] = pd.read_csv(TILE_FEATURES_CSV)
     data["WHOLE_FEATURES"] = pd.read_csv(WHOLE_FEATURES_CSV)
     print("Loaded the saved feature tables")
@@ -1899,8 +1948,8 @@ else:
     data["WHOLE_FEATURES"] = pd.DataFrame([
         {"file": file, **whole} for file, (_, whole) in zip(images["file"], results)
     ])
-    save_table(data["TILE_FEATURES"], TILE_FEATURES_CSV, OVERWRITE)
-    save_table(data["WHOLE_FEATURES"], WHOLE_FEATURES_CSV, OVERWRITE)
+    save_table(data["TILE_FEATURES"], TILE_FEATURES_CSV, overwrite=True)  # computed on purpose: replace
+    save_table(data["WHOLE_FEATURES"], WHOLE_FEATURES_CSV, overwrite=True)
 print(f"Tiles: {data['TILE_FEATURES'].shape}, whole pictures: {data['WHOLE_FEATURES'].shape}")
 
 # %%
