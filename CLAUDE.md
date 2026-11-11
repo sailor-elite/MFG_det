@@ -122,6 +122,7 @@ Report all methods and all classes, including where methods fail.
 /home/qq/Pictures/MFG_det/D   # over-diluted preparations D01–D04
 /home/qq/Pictures/MFG_det/F   # TEST ONLY: frozen milk, F01–F03, good images only
 /home/qq/Pictures/MFG_det/U   # TEST ONLY: UHT milk 3.2%, U01–U03, good images only
+/home/qq/mfg_qc/data/MFG/3-2_fresh_milk # TEST ONLY: 3.2 % fresh milk, M01–M05 (JPG)
 ```
 
 **Warning: some images may be in the wrong folder** [CONFIRMED by user]. Do not trust folder
@@ -147,6 +148,7 @@ LevenhukLite Quick Save, starting at 1 for each preparation.
 | D01–D04 | 1–80 | `overdiluted` (zbyt rozcieńczone) | preparation |
 | F01–F03 | 1–80 | `good` (frozen milk, test only) | good |
 | U01–U03 | 1–80 | `good` (UHT milk, test only) | good |
+| M01–M03 | all | milk32_undiluted | other milk | and | M04–M05 | all | milk32 | other milk |
 
 Notes: blur levels are qualitative, set by the operator with the fine-focus knob
 (light = globules soft but recognisable, heavy = globules merge into blobs); no exact focus offsets
@@ -165,11 +167,13 @@ were recorded. Bubbles and corners were searched for (not grid fields).
 | undiluted | 320 | 4 |
 | overdiluted | 320 | 4 |
 | **Main dataset total** | **3,520** | **28** |
-| good – frozen (test) | 240 | 3 |
-| good – UHT (test) | 240 | 3 |
-| **Grand total** | **4,000** | **34** |
+| frozen (test only, to be flagged) | 240 | 3 |
+| uht (test only, to be flagged) | 240 | 3 |
+| milk32_undiluted – 3.2 % fresh milk, 0 ml (test only, to be flagged) | 366 | 3 |
+| milk32 – 3.2 % fresh milk, 3.5 ml (test only, to be flagged) | 239 | 2 |
+| **Grand total** | **4,605** | **39** |
 
-### 7.4 Preparation log (from `Dziennik_pomiary.xlsx`; times = preparation / start of imaging)
+### 7.4 Preparation log (from `Dziennik_pomiary.xlsx`; times = preparation / imaging)
 
 | ID | Type | Milk | Sudan III | Water | Images | Day | Prep | Photos |
 |---|---|---|---|---|---|---|---|---|
@@ -204,14 +208,26 @@ were recorded. Bubbles and corners were searched for (not grid fields).
 | F01 | test | frozen (from main sample) | 3 drops | 3.5 ml | 80 | 01.11 | 13:08 | 13:13 |
 | F02 | test | frozen (from main sample) | 3 drops | 3.5 ml | 80 | 01.11 | 13:15 | 13:17 |
 | F03 | test | frozen (from main sample) | 3 drops | 3.5 ml | 80 | 01.11 | 13:19 | 13:22 |
-| U01 | test | UHT 3.2% | 3 drops | 3.5 ml | 80 | 01.11? | 14:22 | 14:31 |
-| U02 | test | UHT 3.2% | 3 drops | 3.5 ml | 80 | 01.11? | 14:32 | 14:36 |
-| U03 | test | UHT 3.2% | 3 drops | 3.5 ml | 80 | 01.11? | 14:37 | 14:39 |
+| U01 | test | UHT 3.2% | 3 drops | 3.5 ml | 80 | 01.11 | 14:22 | 14:31 |
+| U02 | test | UHT 3.2% | 3 drops | 3.5 ml | 80 | 01.11 | 14:32 | 14:36 |
+| U03 | test | UHT 3.2% | 3 drops | 3.5 ml | 80 | 01.11 | 14:37 | 14:39 |
+| M01 | test | fresh 3.2% | 3 drops [ASSUMED] | 0 ml | 124 | 11.11 | – | 12:37–12:42 |
+| M02 | test | fresh 3.2% | 3 drops [ASSUMED] | 0 ml | 119 | 11.11 | – | 12:57–13:03 |
+| M03 | test | fresh 3.2% | 3 drops [ASSUMED] | 0 ml | 123 | 11.11 | – | 13:07–13:10 |
+| M04 | test | fresh 3.2% | 3 drops [ASSUMED] | 3.5 ml | 116 | 11.11 | – | 13:15–13:18 |
+| M05 | test | fresh 3.2% | 3 drops [ASSUMED] | 3.5 ml | 123 | 11.11 | – | 13:20–13:24 |
+
+The log's "Photos" time is the END of imaging (confirmed by the file times). U01–U03: the log says "any
+day"; the file times show 01.11. M01–M05: no log entry; times from the files.
 
 B recipe [CONFIRMED]: 1 ml milk + 4.0 ml Sudan III solution, then 1.5 ml water (strong overdose,
-≈60% ethanol in the final mixture → protein coagulation). Pasteurised 3.2% milk (M01–M03) was planned but NOT
-collected. Removed categories (not in the data): oil-contaminated optics, low contrast
-(condenser aperture), unstained.
+≈60% ethanol in the final mixture → protein coagulation). 3.2 % fresh milk (M01–M05) was collected
+later, on 11 Nov 2026 (another carton, 10 days after the main data): M01–M03 undiluted (0 ml),
+M04–M05 diluted (3.5 ml); test only, counted as "to be flagged". Its files are JPG (all other images
+PNG), in `data/MFG/3-2_fresh_milk/` (sub-folders M01, M02, M03, M04_diluted, M05_diluted; files named
+by number only, the preparation comes from the folder). Removed categories (not in the data):
+oil-contaminated optics, low contrast (condenser aperture), unstained.
+
 
 ### 7.5 Known confounds and data caveats (must be handled and reported)
 

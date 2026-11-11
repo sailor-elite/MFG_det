@@ -24,7 +24,9 @@ import os
 os.environ["HF_HOME"] = "/home/qq/mfg_qc/data/weights/huggingface"
 os.environ["TORCH_HOME"] = "/home/qq/mfg_qc/data/weights/torch"
 
+import hashlib
 import pickle
+import re
 import shutil
 import time
 from concurrent.futures import ProcessPoolExecutor
@@ -55,6 +57,9 @@ from tqdm import tqdm
 
 # %%
 RAW_DIR = Path("/home/qq/Pictures/MFG_det")  # raw micrographs, READ ONLY
+# 3.2 % fresh milk, taken 11 Nov 2026: sub-folders M01-M03 (undiluted), M04_diluted, M05_diluted;
+# JPG files named only by number (e.g. 0244.jpg), the preparation comes from the folder name
+EXTRA_DIR = Path("/home/qq/mfg_qc/data/MFG/3-2_fresh_milk")
 MFG_DIR = Path("/home/qq/mfg_qc/data/MFG")    # copies of the raw images, one folder per label
 EXCLUDED_CSV = Path("/home/qq/mfg_qc/data/excluded_images.csv")  # images removed for bad quality
 MANIFEST_CSV = Path("/home/qq/mfg_qc/data/manifest.csv")  # one row per raw image (labels, preps, folds)
@@ -123,8 +128,14 @@ LABELS_BY_TYPE = {
     "F": "frozen",
     "U": "uht",
 }
+# 3.2 % fresh milk (M): the label depends on the preparation. Like F and U it is another milk:
+# counted as defective ("to be flagged") and TEST ONLY.
+LABELS_BY_PREP = {
+    "M01": "milk32_undiluted", "M02": "milk32_undiluted", "M03": "milk32_undiluted",  # 0 ml water
+    "M04": "milk32", "M05": "milk32",                                                 # 3.5 ml water
+}
 
-# Label -> label group (CLAUDE.md §7.2); frozen and uht: other milk type (counted as defective)
+# Label -> label group (CLAUDE.md §7.2); frozen, uht and 3.2 % milk: other milk type (counted as defective)
 LABEL_GROUPS = {
     "good": "good",
     "blur_light": "acquisition",
@@ -138,13 +149,15 @@ LABEL_GROUPS = {
     "corner": "field_position",
     "frozen": "other_milk",
     "uht": "other_milk",
+    "milk32_undiluted": "other_milk",
+    "milk32": "other_milk",
 }
 
-# Expected number of raw images per label (CLAUDE.md §7.3)
+# Expected number of raw images per label (CLAUDE.md §7.3; 3.2 % milk: the number of files taken)
 EXPECTED_COUNTS = {
     "good": 640, "blur_light": 320, "blur_heavy": 320, "filter_yellow": 320, "filter_blue": 320,
     "bubbles": 320, "corner": 320, "overstained": 320, "undiluted": 320, "overdiluted": 320,
-    "frozen": 240, "uht": 240,
+    "frozen": 240, "uht": 240, "milk32_undiluted": 366, "milk32": 239,
 }
 
 # Preparation log (CLAUDE.md §7.4, same as Dziennik_pomiary.xlsx):
@@ -185,9 +198,15 @@ PREP_LOG = {
     "U01": (3.5, "UHT", "2026-11-01", "14:22", "14:31"),
     "U02": (3.5, "UHT", "2026-11-01", "14:32", "14:36"),
     "U03": (3.5, "UHT", "2026-11-01", "14:37", "14:39"),
+    # 3.2 % fresh milk: no log; times of the first and the last file
+    "M01": (0.0, "fresh 3.2%", "2026-11-11", "12:37", "12:42"),
+    "M02": (0.0, "fresh 3.2%", "2026-11-11", "12:57", "13:03"),
+    "M03": (0.0, "fresh 3.2%", "2026-11-11", "13:07", "13:10"),
+    "M04": (3.5, "fresh 3.2%", "2026-11-11", "13:15", "13:18"),
+    "M05": (3.5, "fresh 3.2%", "2026-11-11", "13:20", "13:24"),
 }
 
-# Fixed folds (CLAUDE.md §9 Step 6). F and U are not in any fold: they are test only.
+# Fixed folds (CLAUDE.md §9 Step 6). F, U and M are not in any fold: they are test only.
 FOLDS = {
     1: ["A01", "A02", "A03", "A13", "B01", "C01", "D01"],
     2: ["A04", "A05", "A06", "A16", "B02", "C02", "D02"],
@@ -195,8 +214,9 @@ FOLDS = {
     4: ["A10", "A11", "A12", "A15", "B04", "C04", "D04"],
 }
 # Evaluation runs: test on fold k, choose thresholds and settings on the next fold (cyclic),
-# train on the other two. F and U (no fold) are tested in every run.
+# train on the other two. F, U and M (no fold) are tested in every run.
 VALIDATION_FOLD = {k: k % len(FOLDS) + 1 for k in FOLDS}  # {1: 2, 2: 3, 3: 4, 4: 1}
+TEST_ONLY_LABELS = ["frozen", "uht", "milk32_undiluted", "milk32"]  # other milk types, never trained on
 FLAG_PERCENTILE = 95  # flag an image when it is more unusual than 95 % of good validation images
 RUN_COLOURS = {1: "#2a78d6", 2: "#eb6834", 3: "#1baf7a", 4: "#eda100"}  # one colour per run in figures
 
@@ -236,27 +256,46 @@ data = {}
 # # Helper functions
 
 # %%
-def label_of(path: Path) -> str:
-    """Return the label of one raw image, read from its file name (CLAUDE.md §7.2).
+def image_name(path: Path) -> str:
+    """Return the unique name of an image: "<PREP>_<NNNN>.<ext>".
 
-    The folder is ignored on purpose: some files are stored in the wrong folder
-    (e.g. A11 and A14 are inside A08/).
+    The raw files are already named like that (e.g. "A01_0042.png"). The 3.2 % milk files are named
+    only by number (e.g. "M04_diluted/0244.jpg"); for them the preparation comes from the folder name.
 
     Args:
-        path (Path): raw image file named "<PREP>_<NNNN>.png",
-            e.g. Path("/home/qq/Pictures/MFG_det/A/A01/A01_0042.png").
+        path (Path): image file, e.g. Path(".../A/A01/A01_0042.png") or Path(".../M04_diluted/0244.jpg").
+
+    Returns:
+        str: e.g. "A01_0042.png" or "M04_0244.jpg".
+    """
+    if re.match(r"^[A-Z]\d{2}_", path.name):
+        return path.name
+    return f"{path.parent.name[:3]}_{path.name}"  # "M04_diluted" -> "M04"
+
+
+def label_of(path: Path) -> str:
+    """Return the label of one raw image, read from its (unique) name (CLAUDE.md §7.2).
+
+    The folder is ignored on purpose: some files are stored in the wrong folder
+    (e.g. A11 and A14 are inside A08/). Only the 3.2 % milk files take their preparation from
+    the folder, because their file names have none (see image_name).
+
+    Args:
+        path (Path): raw image file, e.g. Path("/home/qq/Pictures/MFG_det/A/A01/A01_0042.png").
 
     Returns:
         str: label of the image, e.g. "blur_light"
-            (one of the values in LABELS_A or LABELS_BY_TYPE).
+            (one of the values in LABELS_A, LABELS_BY_TYPE or LABELS_BY_PREP).
 
     Raises:
         ValueError: if the preparation type or image number is not in the mapping.
     """
-    prep_id, image_idx = path.stem.split("_")  # "A01_0042" -> "A01", "0042"
-    prep_type = prep_id[0]                       # "A01" -> "A"
-    number = int(image_idx)                      # "0042" -> 42
+    prep_id, image_idx = Path(image_name(path)).stem.split("_")  # "A01_0042" -> "A01", "0042"
+    prep_type = prep_id[0]                                         # "A01" -> "A"
+    number = int(image_idx)                                        # "0042" -> 42
 
+    if prep_id in LABELS_BY_PREP:
+        return LABELS_BY_PREP[prep_id]
     if prep_type == "A":
         for last, label in LABELS_A:
             if number <= last:
@@ -264,7 +303,23 @@ def label_of(path: Path) -> str:
     elif prep_type in LABELS_BY_TYPE:
         return LABELS_BY_TYPE[prep_type]
 
-    raise ValueError(f"No label defined for {path.name}")
+    raise ValueError(f"No label defined for {image_name(path)}")
+
+
+def data_key(names: list[str]) -> str:
+    """Return a short fingerprint of the set of images in use, for the file names of saved results.
+
+    Saved model results depend on which images are used. With the fingerprint in their file name,
+    they are recomputed automatically when images are added or excluded.
+
+    Args:
+        names (list[str]): unique image names, e.g. ["A01_0001.png", ...] (order does not matter).
+
+    Returns:
+        str: number of images + 8 hex characters, e.g. "4571-1a2b3c4d".
+    """
+    digest = hashlib.md5("\n".join(sorted(names)).encode()).hexdigest()[:8]
+    return f"{len(names)}-{digest}"
 
 
 def build_manifest(paths: list[Path], excluded_names: set[str]) -> pd.DataFrame:
@@ -273,24 +328,24 @@ def build_manifest(paths: list[Path], excluded_names: set[str]) -> pd.DataFrame:
     Uses label_of() and the Config globals LABEL_GROUPS, PREP_LOG and FOLDS.
 
     Args:
-        paths (list[Path]): all raw image files, e.g. data["RAW_PICTURES"] (4000 paths).
-        excluded_names (set[str]): file names removed for bad quality,
+        paths (list[Path]): all raw image files, e.g. data["RAW_PICTURES"] (4605 paths).
+        excluded_names (set[str]): unique image names removed for bad quality,
             e.g. {"A02_0009.png", "A08_0001.png", ...}.
 
     Returns:
         pd.DataFrame: one row per image, sorted by file name, with columns
             path (str): raw image path,
-            file (str): file name, e.g. "A01_0042.png",
+            file (str): unique image name (image_name), e.g. "A01_0042.png" or "M04_0244.jpg",
             prep_id (str): e.g. "A01"; prep_type (str): e.g. "A",
             image_idx (int): image number, e.g. 42,
             label (str): e.g. "blur_light"; label_group (str): e.g. "acquisition",
-            is_defect (bool): True for every label except "good" (frozen and uht included),
+            is_defect (bool): True for every label except "good" (other milk types included),
             dilution_ml (float): distilled water added, e.g. 1.5,
-            day (str): e.g. "2026-10-31"; milk_type (str): "fresh", "frozen" or "UHT",
+            day (str): e.g. "2026-10-31"; milk_type (str): "fresh", "frozen", "UHT" or "fresh 3.2%",
             prep_time, photo_time (str): from the log, e.g. "2026-10-31 22:10",
             file_time (str): modification time of the raw file, e.g. "2026-10-31 22:35:12",
             fold (Int64): 1-4, <NA> for test-only preparations,
-            test_only (bool): True for F and U (never used for training),
+            test_only (bool): True for F, U and M (never used for training),
             excluded (bool): True if removed for bad quality.
 
     Raises:
@@ -299,12 +354,13 @@ def build_manifest(paths: list[Path], excluded_names: set[str]) -> pd.DataFrame:
     fold_of = {prep: fold for fold, preps in FOLDS.items() for prep in preps}  # "A01" -> 1
     rows = []
     for path in paths:
-        prep_id, image_idx = path.stem.split("_")  # "A01_0042" -> "A01", "0042"
+        name = image_name(path)                                 # e.g. "A01_0042.png", "M04_0244.jpg"
+        prep_id, image_idx = Path(name).stem.split("_")         # "A01_0042" -> "A01", "0042"
         water_ml, milk_type, day, prep_time, photo_time = PREP_LOG[prep_id]
         label = label_of(path)
         rows.append({
             "path": str(path),
-            "file": path.name,
+            "file": name,
             "prep_id": prep_id,
             "prep_type": prep_id[0],
             "image_idx": int(image_idx),
@@ -317,9 +373,9 @@ def build_manifest(paths: list[Path], excluded_names: set[str]) -> pd.DataFrame:
             "prep_time": f"{day} {prep_time}",
             "photo_time": f"{day} {photo_time}",
             "file_time": datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S"),
-            "fold": fold_of.get(prep_id),  # None for F and U
+            "fold": fold_of.get(prep_id),  # None for F, U and M
             "test_only": prep_id not in fold_of,
-            "excluded": path.name in excluded_names,
+            "excluded": name in excluded_names,
         })
     manifest = pd.DataFrame(rows).sort_values("file", ignore_index=True)
     manifest["fold"] = manifest["fold"].astype("Int64")
@@ -331,9 +387,10 @@ def copy_pictures_by_label(
     dst_dir: Path,
     overwrite: bool = False,
 ) -> pd.DataFrame:
-    """Copy raw images into one folder per label, keeping the original file names.
+    """Copy raw images into one folder per label, under their unique names (image_name).
 
-    Result: dst_dir/<label>/<original file name>, e.g. data/MFG/blur_light/A01_0042.png.
+    Result: dst_dir/<label>/<unique name>, e.g. data/MFG/blur_light/A01_0042.png or
+    data/MFG/milk32/M04_0244.jpg.
     The raw files are only read. Each copy keeps the original modification time
     (needed later for the timestamp check) but is writable (the raw files are read-only).
     A file is first copied as "<name>.part" and renamed when complete, so an
@@ -352,7 +409,7 @@ def copy_pictures_by_label(
             copied (int): files copied in this call,
             skipped (int): files skipped because they already existed,
             n_expected (int): number of images with this label,
-            n_in_folder (int): .png files now in the label folder,
+            n_in_folder (int): image files now in the label folder,
             ok (bool): the folder contains exactly the expected file names.
     """
     rows = []
@@ -363,7 +420,7 @@ def copy_pictures_by_label(
 
         copied = skipped = 0
         for src in paths:
-            dst = label_dir / src.name
+            dst = label_dir / image_name(src)
             if dst.exists() and not overwrite:
                 skipped += 1
                 continue
@@ -374,7 +431,7 @@ def copy_pictures_by_label(
             tmp.replace(dst)
             copied += 1
 
-        names_in_folder = {p.name for p in label_dir.glob("*.png")}
+        names_in_folder = {p.name for p in label_dir.iterdir() if p.suffix.lower() in (".png", ".jpg")}
         rows.append({
             "label": label,
             "folder_existed": folder_existed,
@@ -382,7 +439,7 @@ def copy_pictures_by_label(
             "skipped": skipped,
             "n_expected": len(paths),
             "n_in_folder": len(names_in_folder),
-            "ok": names_in_folder == {p.name for p in paths},
+            "ok": names_in_folder == {image_name(p) for p in paths},
         })
         print(f"{label}: copied {copied}, skipped {skipped}")
 
@@ -1101,7 +1158,8 @@ def evaluate_method(
         tuple[pd.DataFrame, pd.DataFrame]:
             metrics: one row per run, on the test fold (A-D images): auroc, balanced_accuracy,
                 har (harmonic mean of the good and defect recall), false_alarms_good,
-                detected_defects; plus detected_frozen and detected_uht (test-only images);
+                detected_defects; plus detected_<label> for every label in TEST_ONLY_LABELS
+                (e.g. detected_frozen, detected_milk32);
             predictions: one row per image and run (test and test-only images): run, file, label,
                 is_defect, role ("test" or "test_only"), score, unusualness, flagged, and
                 ranking_score (what AUROC uses: the raw score, or for two-sided scores u with ties
@@ -1112,6 +1170,9 @@ def evaluate_method(
     for run in scores.columns:
         roles = run_roles(info["fold"], run)
         s = scores[run].reindex(info.index)
+        if s.isna().any():  # e.g. saved results from before images were added
+            raise ValueError(f"No score for {s.isna().sum()} images (e.g. {s.index[s.isna()][0]}); "
+                             "the saved results are out of date: set USE_SAVED_RESULTS = False")
         good_val = s[(roles == "validation") & (info["label"] == "good")]
         u = pd.Series(unusualness(s, good_val, two_sided), index=info.index)
         flagged = u > FLAG_PERCENTILE
@@ -1131,8 +1192,8 @@ def evaluate_method(
             "har": harmonic_mean([passed_good, detected]),
             "false_alarms_good": 1 - passed_good,
             "detected_defects": detected,
-            "detected_frozen": flagged[test_only & (info["label"] == "frozen")].mean(),
-            "detected_uht": flagged[test_only & (info["label"] == "uht")].mean(),
+            **{f"detected_{label}": flagged[test_only & (info["label"] == label)].mean()
+               for label in TEST_ONLY_LABELS},
         })
         shown = test | test_only
         prediction_parts.append(pd.DataFrame({
@@ -1561,7 +1622,7 @@ def plot_confusion_matrix(predictions: pd.DataFrame, classes: list[str], extra_r
     Args:
         predictions (pd.DataFrame): from evaluate_multiclass (columns label, predicted, role).
         classes (list[str]): the labels (rows and columns), e.g. good + 10 defect types.
-        extra_rows (list[str]): labels shown below the matrix, e.g. ["frozen", "uht"]: never trained on,
+        extra_rows (list[str]): labels shown below the matrix, e.g. TEST_ONLY_LABELS: never trained on,
             so their row only shows what the model calls them.
         title (str): figure title.
 
@@ -1669,32 +1730,41 @@ def extract_deep_features(paths: list[Path], timm_name: str, batch_images: int, 
                           parts_dir: Path, use_saved: bool, chunk: int = 200) -> dict:
     """Compute the deep features of every tile and whole picture with one pretrained network.
 
-    Resumable: the images are processed in chunks of `chunk` images; every finished chunk is saved in
-    parts_dir and, with use_saved = True, skipped when the function is run again (e.g. after an
-    interruption). The saved chunks are the saved result (no extra copy).
+    Saved by image name and resumable: features are saved in chunks of `chunk` images (each chunk file
+    lists its image names). With use_saved = True, images that already have saved features are not
+    computed again, so after an interruption or after adding images only the missing ones are
+    computed. A later chunk replaces an earlier one for the same image.
 
     Args:
-        paths (list[Path]): image files, e.g. the 3,966 images that are not excluded.
+        paths (list[Path]): image files, e.g. the images that are not excluded.
         timm_name (str): e.g. "vit_small_patch14_dinov2.lvd142m".
         batch_images (int): images per GPU batch, e.g. 4 (= 48 tiles + 4 whole pictures).
         workers (int): processes that read the images, e.g. DATA_WORKERS.
-        parts_dir (Path): folder for the finished chunks, e.g. DEEP_FEATURES_DIR / "dinov2_vits14_parts".
-        use_saved (bool): True = reuse finished chunks (e.g. USE_SAVED_RESULTS); False = recompute all
-            chunks and replace them.
+        parts_dir (Path): folder for the saved chunks, e.g. DEEP_FEATURES_DIR / "dinov2_vits14_parts".
+        use_saved (bool): True = reuse saved features (e.g. USE_SAVED_RESULTS); False = compute all
+            images again (new chunks, which then replace the old ones).
         chunk (int): images per saved chunk, e.g. 200.
 
     Returns:
-        dict: "files" (list[str], file names), "tiles" (np.ndarray float32 of shape (n, 12, 768)),
-            "whole" (np.ndarray float32 of shape (n, 768)).
+        dict: "files" (list[str], unique image names in the order of paths), "tiles" (np.ndarray
+            float32 of shape (n, 12, 768)), "whole" (np.ndarray float32 of shape (n, 768)).
     """
     parts_dir.mkdir(parents=True, exist_ok=True)
-    starts = list(range(0, len(paths), chunk))
-    todo = [s for s in starts if not (use_saved and (parts_dir / f"part_{s:05d}.npz").exists())]
+    names = [image_name(p) for p in paths]
+    saved = {}  # image name -> (tile features (12, 768), whole-picture features (768,))
+    if use_saved:
+        for part in sorted(parts_dir.glob("part_*.npz")):  # oldest first, so newer chunks win
+            with np.load(part) as z:
+                for name, tiles, whole in zip(z["files"], z["tiles"], z["whole"]):
+                    saved[str(name)] = (tiles, whole)
+    todo = [p for p, name in zip(paths, names) if name not in saved]
     if todo:
         model = make_backbone(timm_name)
-        progress = tqdm(total=sum(len(paths[s:s + chunk]) for s in todo), desc=timm_name.split(".")[0], unit="image")
-        for start in todo:
-            loader = DataLoader(ModelInputs(paths[start:start + chunk], ROI, CROP_SIZE, WHOLE_SIZE),
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")  # new chunk files sort after the older ones
+        progress = tqdm(total=len(todo), desc=timm_name.split(".")[0], unit="image")
+        for k, start in enumerate(range(0, len(todo), chunk)):
+            chunk_paths = todo[start:start + chunk]
+            loader = DataLoader(ModelInputs(chunk_paths, ROI, CROP_SIZE, WHOLE_SIZE),
                                 batch_size=batch_images, num_workers=workers)
             tile_parts, whole_parts = [], []
             for tiles, whole in loader:
@@ -1703,15 +1773,17 @@ def extract_deep_features(paths: list[Path], timm_name: str, batch_images: int, 
                 tile_parts.append(tile_feats.view(n, -1, tile_feats.shape[1]).cpu().numpy())
                 whole_parts.append(backbone_features(model, whole.to(DEVICE)).cpu().numpy())
                 progress.update(n)
-            np.savez(parts_dir / f"part_{start:05d}.npz", tiles=np.concatenate(tile_parts),
-                     whole=np.concatenate(whole_parts))
+            chunk_names = [image_name(p) for p in chunk_paths]
+            chunk_tiles, chunk_whole = np.concatenate(tile_parts), np.concatenate(whole_parts)
+            np.savez(parts_dir / f"part_{stamp}_{k:03d}.npz", files=np.array(chunk_names),
+                     tiles=chunk_tiles, whole=chunk_whole)
+            saved.update({name: (t, w) for name, t, w in zip(chunk_names, chunk_tiles, chunk_whole)})
         progress.close()
         del model
         torch.cuda.empty_cache()
-    parts = [np.load(parts_dir / f"part_{s:05d}.npz") for s in starts]
-    return {"files": [p.name for p in paths],
-            "tiles": np.concatenate([p["tiles"] for p in parts]),
-            "whole": np.concatenate([p["whole"] for p in parts])}
+    return {"files": names,
+            "tiles": np.stack([saved[name][0] for name in names]),
+            "whole": np.stack([saved[name][1] for name in names])}
 
 
 def deep_feature_tables(features: dict) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -1739,7 +1811,9 @@ def deep_feature_tables(features: dict) -> tuple[pd.DataFrame, pd.DataFrame]:
 # # Loading data
 
 # %%
-data["RAW_PICTURES"] = sorted(p for p in RAW_DIR.rglob("*") if p.is_file())
+# Raw images (4000 PNG) followed by the 3.2 % fresh milk images (605 JPG in EXTRA_DIR)
+data["RAW_PICTURES"] = (sorted(p for p in RAW_DIR.rglob("*") if p.is_file())
+                        + sorted(p for p in EXTRA_DIR.rglob("*") if p.is_file()))
 print(len(data["RAW_PICTURES"]), "files")
 
 # %%
@@ -1772,35 +1846,41 @@ data["EXCLUDED"] = pd.read_csv(EXCLUDED_CSV)
 excluded_names = set(data["EXCLUDED"]["file"])
 
 # Catch typos: every excluded name must exist in the raw data
-unknown = excluded_names - {p.name for p in data["RAW_PICTURES"]}
+unknown = excluded_names - {image_name(p) for p in data["RAW_PICTURES"]}
 if unknown:
     raise ValueError(f"Excluded files not found in the raw data: {sorted(unknown)}")
 
 data["PICTURES_BY_LABEL"] = {
-    label: [p for p in paths if p.name not in excluded_names]
+    label: [p for p in paths if image_name(p) not in excluded_names]
     for label, paths in data["PICTURES_BY_LABEL"].items()
 }
-print(len(excluded_names), "images excluded")
+# Fingerprint of the images in use: part of the file names of saved model results, so that they
+# are recomputed automatically when images are added or excluded
+data["KEY"] = data_key([image_name(p) for paths in data["PICTURES_BY_LABEL"].values() for p in paths])
+print(len(excluded_names), "images excluded | images in use:", data["KEY"])
 {label: len(paths) for label, paths in data["PICTURES_BY_LABEL"].items()}
 
 # %%
 # Copy the raw images to MFG_DIR/<label>/ (about 38 GB; files that already exist are skipped)
 copy_summary = load_or_compute(
-    CACHE_DIR / "copy_summary.pkl",
+    CACHE_DIR / f"copy_summary_{data['KEY']}.pkl",
     lambda: copy_pictures_by_label(data["PICTURES_BY_LABEL"], MFG_DIR, overwrite=False),
     USE_SAVED_RESULTS,
 )
 copy_summary
 
 # %%
-# First image of every label (full resolution, axes in pixels)
-fig, axes = plt.subplots(3, 4, figsize=(20, 12), constrained_layout=True)
+# First image of every label (full resolution, axes in pixels), 4 per row
+n_rows = -(-len(data["PICTURES_BY_LABEL"]) // 4)  # round up, e.g. 14 labels -> 4 rows
+fig, axes = plt.subplots(n_rows, 4, figsize=(20, 4 * n_rows), constrained_layout=True)
 for ax, (label, paths) in zip(axes.flat, data["PICTURES_BY_LABEL"].items()):
     img = cv2.cvtColor(cv2.imread(str(paths[0])), cv2.COLOR_BGR2RGB)  # OpenCV reads BGR
     ax.imshow(img)
-    ax.set_title(f"{label}  ({paths[0].name})")
+    ax.set_title(f"{label}  ({image_name(paths[0])})")
     ax.set_xlabel("x [px]")
     ax.set_ylabel("y [px]")
+for ax in axes.flat[len(data["PICTURES_BY_LABEL"]):]:  # empty panels at the end
+    ax.set_visible(False)
 
 fig_path = RESULTS_DIR / "example_images.png"
 if fig_path.exists() and not OVERWRITE:
@@ -1813,9 +1893,10 @@ plt.show()
 # %% [markdown]
 # # Creating manifest
 #
-# One row per raw image (all 4000; the excluded images are kept and flagged) with its label, the
-# preparation details from the preparation log (CLAUDE.md §7.4) and the fold (§9 Step 6).
-# F and U have no fold: they are test only. Saved to `data/manifest.csv`; later steps read it.
+# One row per raw image (all 4605, incl. the 3.2 % milk; the excluded images are kept and flagged)
+# with its label, the preparation details from the preparation log (CLAUDE.md §7.4) and the fold
+# (§9 Step 6). F, U and M have no fold: they are test only. Saved to `data/manifest.csv`; later steps
+# read it.
 
 # %%
 data["MANIFEST"] = build_manifest(data["RAW_PICTURES"], set(data["EXCLUDED"]["file"]))
@@ -1944,12 +2025,15 @@ else:
 plt.show()
 
 # %%
-# The ROI cut into tiles of CROP_SIZE px, drawn on the first image of every label (12 labels)
+# The ROI cut into tiles of CROP_SIZE px, drawn on the first image of every label (4 per row)
 x0, y0, x1, y1 = ROI
 n_cols = (x1 - x0) // CROP_SIZE            # 4
 n_tiles = n_cols * ((y1 - y0) // CROP_SIZE)  # 12
 
-fig, axes = plt.subplots(3, 4, figsize=(24, 15), constrained_layout=True)
+n_rows = -(-len(data["PICTURES_BY_LABEL"]) // 4)  # round up, e.g. 14 labels -> 4 rows
+fig, axes = plt.subplots(n_rows, 4, figsize=(24, 5 * n_rows), constrained_layout=True)
+for ax in axes.flat[len(data["PICTURES_BY_LABEL"]):]:  # empty panels at the end
+    ax.set_visible(False)
 for ax, (label, paths) in zip(axes.flat, data["PICTURES_BY_LABEL"].items()):
     path = paths[0]
     img = cv2.cvtColor(cv2.imread(str(path)), cv2.COLOR_BGR2RGB)[y0:y1, x0:x1]  # ROI only
@@ -1962,7 +2046,7 @@ for ax, (label, paths) in zip(axes.flat, data["PICTURES_BY_LABEL"].items()):
         row, col = divmod(k, n_cols)  # tile number -> (row, column), e.g. 5 -> (1, 1)
         ax.text(x0 + col * CROP_SIZE + 15, y0 + row * CROP_SIZE + 55, str(k),
                 color="yellow", fontsize=15, weight="bold")
-    ax.set_title(f"{label} ({path.name})", fontsize=14)
+    ax.set_title(f"{label} ({image_name(path)})", fontsize=14)
     ax.set_xlabel("x [px]")
     ax.set_ylabel("y [px]")
 fig.suptitle(f"ROI (x {x0}-{x1}, y {y0}-{y1}) cut into {n_tiles} tiles of {CROP_SIZE} x {CROP_SIZE} px",
@@ -2185,42 +2269,12 @@ in_folds = images["fold"].notna()
 checks = {
     "every image (A-D) is tested in exactly 1 run": ((image_roles[in_folds] == "test").sum(axis=1) == 1).all(),
     "every image (A-D) is validation in exactly 1 run": ((image_roles[in_folds] == "validation").sum(axis=1) == 1).all(),
-    "F and U are 'test_only' in every run": (image_roles[~in_folds] == "test_only").all(axis=None),
+    "F, U and M are 'test_only' in every run": (image_roles[~in_folds] == "test_only").all(axis=None),
     "no preparation is in two roles within a run": all(
         images.assign(role=image_roles[run]).groupby("prep_id")["role"].nunique().max() == 1 for run in image_roles
     ),
 }
 pd.Series(checks, name="ok")
-
-# %% [markdown]
-# ## Plain variance of the Laplacian
-#
-# The evaluation tried on the simplest possible detector, before it is used for all methods:
-# **"an image is defective if its variance of the Laplacian (VoL, sharpness of the whole picture) is
-# unusual compared with good images"**. Nothing is trained. In every run:
-# 1. the VoL of the good images of the validation fold shows what "normal" is;
-# 2. a test image is flagged as defective if its VoL is below the 2.5th or above the 97.5th
-#    percentile of them (two-sided: blur lowers VoL, undiluted raises it);
-# 3. the decisions are compared with the true labels.
-#
-# Result: the metrics per run (table) and the figure (ROC curves, confusion matrix, flagged per label).
-
-# %%
-eval_info = data["MANIFEST"].loc[~data["MANIFEST"]["excluded"]].set_index("file")[["fold", "label", "is_defect"]]
-eval_labels = list(data["PICTURES_BY_LABEL"])  # good, blur_light, ..., frozen, uht
-demo_vol = pd.read_csv(WHOLE_FEATURES_CSV, usecols=["file", "vol"]).set_index("file")["vol"]
-demo_metrics, demo_predictions = evaluate_method(
-    pd.DataFrame({run: demo_vol for run in FOLDS}), eval_info, two_sided=True
-)
-demo_summary = pd.concat([demo_metrics, demo_metrics.agg(["mean", "std"])])
-demo_summary.index = [f"run {run}" for run in demo_metrics.index] + ["mean", "SD"]
-demo_summary.round(3)
-
-# %%
-fig = plot_evaluation(demo_metrics, demo_predictions, eval_labels,
-                      "Plain variance of the Laplacian (whole picture, two-sided)")
-save_figure(fig, RESULTS_DIR / "evaluation_example_vol.png", OVERWRITE)
-plt.show()
 
 # %% [markdown]
 # # Classical methods
@@ -2424,41 +2478,46 @@ plt.show()
 # ## Features of all images
 #
 # The 95 features for every tile (12 per image, full resolution) and for every whole picture
-# (the ROI scaled to 768 x 576 px), for all 3,966 images that are not excluded. Computed once in
-# `DATA_WORKERS` parallel processes (about 10-15 min) and saved to `data/features/`; later runs only
-# read the files (unless `USE_SAVED_RESULTS = False`).
+# (the ROI scaled to 768 x 576 px), for all images that are not excluded. Saved in `data/features/`
+# by image name: only images without saved features are computed (all of them the first time,
+# about 16 min in `DATA_WORKERS` parallel processes; later e.g. only newly added images). With
+# `USE_SAVED_RESULTS = False` all images are computed again.
 
 # %%
-if TILE_FEATURES_CSV.exists() and WHOLE_FEATURES_CSV.exists() and USE_SAVED_RESULTS:
-    data["TILE_FEATURES"] = pd.read_csv(TILE_FEATURES_CSV)
-    data["WHOLE_FEATURES"] = pd.read_csv(WHOLE_FEATURES_CSV)
-    print("Loaded the saved feature tables")
-else:
-    images = data["TILES"].drop_duplicates("file")[["file", "path"]]
+images = data["TILES"].drop_duplicates("file")[["file", "path"]]  # images in use
+have_saved = TILE_FEATURES_CSV.exists() and WHOLE_FEATURES_CSV.exists() and USE_SAVED_RESULTS
+saved_tiles = pd.read_csv(TILE_FEATURES_CSV) if have_saved else pd.DataFrame(columns=["file"])
+saved_whole = pd.read_csv(WHOLE_FEATURES_CSV) if have_saved else pd.DataFrame(columns=["file"])
+todo = images[~images["file"].isin(saved_whole["file"])]
+print(f"{len(images) - len(todo)} images with saved features, {len(todo)} to compute")
+if len(todo):
     t0 = time.time()
     results = run_parallel(
         partial(image_features, roi=ROI, tile=CROP_SIZE, whole_size=WHOLE_SIZE,
                 thresholds=(data["GLOBULE_THRESHOLD"], data["GLOBULE_THRESHOLD_WHOLE"]),
                 sigmas=(GLOBULE_BLUR_SIGMA, GLOBULE_BLUR_SIGMA_WHOLE)),
-        [Path(p) for p in images["path"]], DATA_WORKERS, desc="features",
+        [Path(p) for p in todo["path"]], DATA_WORKERS, desc="features",
     )
     print(f"Computed in {(time.time() - t0) / 60:.1f} min")
-    data["TILE_FEATURES"] = pd.DataFrame([
+    new_tiles = pd.DataFrame([
         {"file": file, "tile_idx": k, **features}
-        for file, (tile_list, _) in zip(images["file"], results)
+        for file, (tile_list, _) in zip(todo["file"], results)
         for k, features in enumerate(tile_list)
     ])
-    data["WHOLE_FEATURES"] = pd.DataFrame([
-        {"file": file, **whole} for file, (_, whole) in zip(images["file"], results)
-    ])
-    save_table(data["TILE_FEATURES"], TILE_FEATURES_CSV, overwrite=True)  # computed on purpose: replace
-    save_table(data["WHOLE_FEATURES"], WHOLE_FEATURES_CSV, overwrite=True)
+    new_whole = pd.DataFrame([{"file": file, **whole} for file, (_, whole) in zip(todo["file"], results)])
+    saved_tiles = pd.concat([saved_tiles, new_tiles], ignore_index=True) if len(saved_tiles) else new_tiles
+    saved_whole = pd.concat([saved_whole, new_whole], ignore_index=True) if len(saved_whole) else new_whole
+    save_table(saved_tiles, TILE_FEATURES_CSV, overwrite=True)  # saved features + the new ones
+    save_table(saved_whole, WHOLE_FEATURES_CSV, overwrite=True)
+# Keep only the images in use (e.g. not images excluded later)
+data["TILE_FEATURES"] = saved_tiles[saved_tiles["file"].isin(images["file"])].reset_index(drop=True)
+data["WHOLE_FEATURES"] = saved_whole[saved_whole["file"].isin(images["file"])].reset_index(drop=True)
 print(f"Tiles: {data['TILE_FEATURES'].shape}, whole pictures: {data['WHOLE_FEATURES'].shape}")
 
 # %%
 # Median of every single-value feature per label, over all tiles and over all whole pictures
 label_of_file = data["TILES"].drop_duplicates("file").set_index("file")["label"]
-label_order = list(data["PICTURES_BY_LABEL"])  # good, blur_light, ..., frozen, uht
+label_order = list(data["PICTURES_BY_LABEL"])  # good, blur_light, ..., frozen, uht, milk32_undiluted, milk32
 single_features = [c for c in data["WHOLE_FEATURES"].columns if c != "file" and not c.startswith("hist_")]
 feature_medians = {
     name: table.assign(label=table["file"].map(label_of_file))
@@ -2500,6 +2559,36 @@ mean_hists_whole = (data["WHOLE_FEATURES"].assign(label=data["WHOLE_FEATURES"]["
 fig = plot_label_histograms(mean_hists_whole,
                             "Average histograms over all WHOLE PICTURES of every label (768 x 576 px)")
 save_figure(fig, RESULTS_DIR / "histograms_all_whole.png", OVERWRITE)
+plt.show()
+
+# %% [markdown]
+# ## Plain variance of the Laplacian
+#
+# The evaluation (section `# Evaluation`) tried on the simplest possible detector, before it is used
+# for all methods: **"an image is defective if its variance of the Laplacian (VoL, sharpness of the
+# whole picture) is unusual compared with good images"**. Nothing is trained. In every run:
+# 1. the VoL of the good images of the validation fold shows what "normal" is;
+# 2. a test image is flagged as defective if its VoL is below the 2.5th or above the 97.5th
+#    percentile of them (two-sided: blur lowers VoL, undiluted raises it);
+# 3. the decisions are compared with the true labels.
+#
+# Result: the metrics per run (table) and the figure (ROC curves, confusion matrix, flagged per label).
+
+# %%
+eval_info = data["MANIFEST"].loc[~data["MANIFEST"]["excluded"]].set_index("file")[["fold", "label", "is_defect"]]
+eval_labels = list(data["PICTURES_BY_LABEL"])  # good, blur_light, ..., frozen, uht, milk32_undiluted, milk32
+demo_vol = data["WHOLE_FEATURES"].set_index("file")["vol"]  # VoL of every whole picture (cell above)
+demo_metrics, demo_predictions = evaluate_method(
+    pd.DataFrame({run: demo_vol for run in FOLDS}), eval_info, two_sided=True
+)
+demo_summary = pd.concat([demo_metrics, demo_metrics.agg(["mean", "std"])])
+demo_summary.index = [f"run {run}" for run in demo_metrics.index] + ["mean", "SD"]
+demo_summary.round(3)
+
+# %%
+fig = plot_evaluation(demo_metrics, demo_predictions, eval_labels,
+                      "Plain variance of the Laplacian (whole picture, two-sided)")
+save_figure(fig, RESULTS_DIR / "evaluation_example_vol.png", OVERWRITE)
 plt.show()
 
 # %% [markdown]
@@ -2572,7 +2661,7 @@ plt.show()
 
 # %%
 one_class_image_scores = load_or_compute(
-    CACHE_DIR / "one_class_scores.pkl",
+    CACHE_DIR / f"one_class_scores_{data['KEY']}.pkl",
     lambda: run_one_class_detectors(ONE_CLASS_DETECTORS, data["WHOLE_FEATURES"], data["TILE_FEATURES"], eval_info,
                                     desc="handcrafted one-class"),
     USE_SAVED_RESULTS,
@@ -2625,7 +2714,7 @@ plt.show()
 
 # %%
 supervised_image_scores = load_or_compute(
-    CACHE_DIR / "supervised_scores.pkl",
+    CACHE_DIR / f"supervised_scores_{data['KEY']}.pkl",
     lambda: run_models(SUPERVISED_MODELS, data["WHOLE_FEATURES"], data["TILE_FEATURES"], eval_info,
                        supervised_scores, desc="handcrafted supervised"),
     USE_SAVED_RESULTS,
@@ -2680,9 +2769,9 @@ family_best[["method", "auroc", "balanced_accuracy", "har", "false_alarms_pct"] 
 # (below the line) only show what the model calls them.
 
 # %%
-t2_classes = [label for label in eval_labels if label not in ("frozen", "uht")]  # good + 10 defect types
+t2_classes = [label for label in eval_labels if label not in TEST_ONLY_LABELS]  # good + 10 defect types
 t2_probabilities = load_or_compute(
-    CACHE_DIR / "multiclass_probabilities.pkl",
+    CACHE_DIR / f"multiclass_probabilities_{data['KEY']}.pkl",
     lambda: run_multiclass_models(SUPERVISED_MODELS, data["WHOLE_FEATURES"], data["TILE_FEATURES"], eval_info,
                                   t2_classes, desc="handcrafted defect type"),
     USE_SAVED_RESULTS,
@@ -2700,7 +2789,7 @@ data["DEFECT_TYPE"].sort_values("mean_recall", ascending=False).round(3)
 # %%
 # Confusion matrix of the best model (highest mean recall over the 11 labels)
 best_t2 = data["DEFECT_TYPE"].sort_values("mean_recall", ascending=False)["method"].iloc[0]
-fig = plot_confusion_matrix(t2_results[tuple(best_t2.split(" | "))][1], t2_classes, ["frozen", "uht"],
+fig = plot_confusion_matrix(t2_results[tuple(best_t2.split(" | "))][1], t2_classes, TEST_ONLY_LABELS,
                             f"Defect type, best model: {best_t2}")
 save_figure(fig, RESULTS_DIR / "defect_type_confusion.png", OVERWRITE)
 plt.show()
@@ -2763,7 +2852,7 @@ for backbone, features in deep_features.items():  # every backbone in DEEP_BACKB
         # Progress bar: one step = one model trained on one input in one run (4 models x 2 inputs x 4 runs),
         # and next to it what is trained right now, e.g. "Random forest | tiles | run 2 of 4".
         scores = load_or_compute(
-            CACHE_DIR / f"deep_{backbone}_{family}.pkl",
+            CACHE_DIR / f"deep_{backbone}_{family}_{data['KEY']}.pkl",
             lambda: run_models(models, whole_table, tile_table, eval_info, score_fn, desc=f"{backbone} {family}"),
             USE_SAVED_RESULTS,
         )
@@ -2837,8 +2926,8 @@ pyod_inputs = {"handcrafted": (data["WHOLE_FEATURES"], data["TILE_FEATURES"])}
 pyod_inputs.update({backbone: deep_feature_tables(features) for backbone, features in deep_features.items()})
 pyod_rows = []
 for feature_set, (whole_table, tile_table) in pyod_inputs.items():
-    # saved after the first run (the handcrafted file keeps its earlier name)
-    cache_file = CACHE_DIR / ("pyod_scores.pkl" if feature_set == "handcrafted" else f"pyod_{feature_set}.pkl")
+    # saved after the first run, per image set (data["KEY"])
+    cache_file = CACHE_DIR / f"pyod_{feature_set}_{data['KEY']}.pkl"
     # progress bar: one step = one detector trained on one input in one run (5 x 2 x 4 = 40 steps)
     scores = load_or_compute(
         cache_file,
