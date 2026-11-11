@@ -172,6 +172,9 @@ FOLDS = {
     3: ["A07", "A08", "A09", "A14", "B03", "C03", "D03"],
     4: ["A10", "A11", "A12", "A15", "B04", "C04", "D04"],
 }
+# Evaluation runs: test on fold k, choose thresholds and settings on the next fold (cyclic),
+# train on the other two. F and U (no fold) are tested in every run.
+VALIDATION_FOLD = {k: k % len(FOLDS) + 1 for k in FOLDS}  # {1: 2, 2: 3, 3: 4, 4: 1}
 
 data = {}
 
@@ -899,6 +902,25 @@ def plot_feature_boxplots(
     return fig
 
 
+def run_roles(folds: pd.Series, test_fold: int) -> pd.Series:
+    """Return the role of every row in one evaluation run, from its fold.
+
+    Args:
+        folds (pd.Series): fold of every row (1-4, <NA> for the test-only preparations F and U),
+            e.g. data["MANIFEST"]["fold"].
+        test_fold (int): the fold tested in this run, 1-4.
+
+    Returns:
+        pd.Series: same index, with "test" (test fold), "validation" (VALIDATION_FOLD[test_fold]),
+            "train" (the other two folds) or "test_only" (F and U, tested in every run).
+    """
+    roles = pd.Series("train", index=folds.index)
+    roles[folds == test_fold] = "test"
+    roles[folds == VALIDATION_FOLD[test_fold]] = "validation"
+    roles[folds.isna()] = "test_only"
+    return roles
+
+
 # %% [markdown]
 # # Loading data
 
@@ -1296,6 +1318,52 @@ load_options["images/s (1 core)"] = 1000 / load_options["ms per image"]
 load_options[f"images/s ({DATA_WORKERS} workers)"] = load_options["images/s (1 core)"] * DATA_WORKERS
 load_options[f"1 pass, {DATA_WORKERS} workers [s]"] = n_images / load_options[f"images/s ({DATA_WORKERS} workers)"]
 load_options.round(1)
+
+# %% [markdown]
+# # Evaluation
+#
+# The same exam for every method (CLAUDE.md §9 Step 6):
+# - 4 runs: test on fold k, choose the percentile threshold and settings on the validation fold
+#   (the next fold, cyclic), train on the other two folds. F and U are tested in every run.
+# - Every score is turned into a percentile of the good validation images; an image is flagged as
+#   defective above the 95th percentile (about 5 % false alarms on good).
+# - Metrics per image: AUROC, balanced accuracy, HAR, recall per class, false alarms on good,
+#   detection table; supervised methods also the defect-type confusion matrix.
+
+# %% [markdown]
+# ## Fold plan
+#
+# Which preparations train, validate and test in each of the 4 runs.
+
+# %%
+preps = data["MANIFEST"].drop_duplicates("prep_id").set_index("prep_id")["fold"]  # prep -> fold
+fold_plan = pd.DataFrame({
+    f"run {k}": run_roles(preps, k).groupby(run_roles(preps, k)).apply(lambda s: ", ".join(s.index))
+    for k in FOLDS
+}).T[["train", "validation", "test", "test_only"]]
+fold_plan
+
+# %%
+# Images used (not excluded) per role in every run, and checks
+images = data["MANIFEST"][~data["MANIFEST"]["excluded"]]
+image_roles = pd.DataFrame({f"run {k}": run_roles(images["fold"], k) for k in FOLDS})
+display(pd.DataFrame({
+    run: image_roles[run].value_counts() for run in image_roles
+}).T[["train", "validation", "test", "test_only"]].assign(
+    good_in_validation=[((image_roles[run] == "validation") & (images["label"] == "good")).sum()
+                        for run in image_roles]
+))
+
+in_folds = images["fold"].notna()
+checks = {
+    "every image (A-D) is tested in exactly 1 run": ((image_roles[in_folds] == "test").sum(axis=1) == 1).all(),
+    "every image (A-D) is validation in exactly 1 run": ((image_roles[in_folds] == "validation").sum(axis=1) == 1).all(),
+    "F and U are 'test_only' in every run": (image_roles[~in_folds] == "test_only").all(axis=None),
+    "no preparation is in two roles within a run": all(
+        images.assign(role=image_roles[run]).groupby("prep_id")["role"].nunique().max() == 1 for run in image_roles
+    ),
+}
+pd.Series(checks, name="ok")
 
 # %% [markdown]
 # # Classical methods
