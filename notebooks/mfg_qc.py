@@ -948,6 +948,54 @@ def unusualness(scores: np.ndarray, good_val_scores: np.ndarray, two_sided: bool
     return 2 * np.abs(p - 50) if two_sided else p
 
 
+def two_sided_score(values: np.ndarray, good_ref: np.ndarray) -> np.ndarray:
+    """Return the two-sided unusualness u (0-100) with ties broken, for ranking (AUROC) and tiles.
+
+    Values beyond the range of the good reference all get u = 100 (ties). The ties are broken by the
+    distance from the good median in interquartile ranges: u + 0.1 * d / (1 + d). The added amount
+    is < 0.1, smaller than one step of u, so the order of different u values never changes.
+
+    Args:
+        values (np.ndarray): feature values, e.g. VoL of every image or tile, shape (n,).
+        good_ref (np.ndarray): the same feature of the good validation images or tiles.
+
+    Returns:
+        np.ndarray: float array of shape (n,), about 0-100.1; higher = more unusual.
+    """
+    ref = np.asarray(good_ref, dtype=float)
+    q25, median, q75 = np.percentile(ref, [25, 50, 75])
+    spread = q75 - q25 if q75 > q25 else 1.0
+    distance = np.abs(np.asarray(values, dtype=float) - median) / spread
+    return unusualness(values, ref, two_sided=True) + 0.1 * distance / (1 + distance)
+
+
+def tile_image_scores(tiles: pd.DataFrame, feature: str, info: pd.DataFrame, agg: str) -> pd.DataFrame:
+    """Return, for every run, an image score made from the 12 tile scores of one feature.
+
+    In every run, each tile gets its two-sided unusualness (two_sided_score) compared with the good
+    tiles of the validation fold; the image score is the max ("its most unusual tile") or the mean
+    of its 12 tile values. Higher = more unusual (so it is evaluated one-sided).
+
+    Args:
+        tiles (pd.DataFrame): one row per tile with columns file and the feature, e.g. data["TILE_FEATURES"].
+        feature (str): feature name, e.g. "vol".
+        info (pd.DataFrame): index = file, columns fold and label (images that are not excluded).
+        agg (str): "max" or "mean".
+
+    Returns:
+        pd.DataFrame: index = file, one column per run (1-4) with the image score (about 0-100).
+    """
+    files = tiles["file"]
+    tile_fold, tile_label = files.map(info["fold"]), files.map(info["label"])
+    image_scores = {}
+    for run in FOLDS:
+        roles = run_roles(tile_fold, run)
+        reference = tiles.loc[(roles == "validation") & (tile_label == "good"), feature]
+        tile_score = pd.Series(two_sided_score(tiles[feature], reference), index=tiles.index)
+        image_scores[run] = tile_score.groupby(files).agg(agg)
+    return pd.DataFrame(image_scores)
+
+
 def harmonic_mean(values: list[float]) -> float:
     """Return the harmonic mean, e.g. of recalls (HAR); 0 if any value is 0.
 
@@ -989,14 +1037,8 @@ def evaluate_method(
         good_val = s[(roles == "validation") & (info["label"] == "good")]
         u = pd.Series(unusualness(s, good_val, two_sided), index=info.index)
         flagged = u > FLAG_PERCENTILE
-        if two_sided:
-            # For AUROC / ROC only: images beyond the range of the good validation images all get
-            # u = 100 (ties); break the ties by the distance from the good median (in IQRs). The
-            # added amount is < 0.1, smaller than one step of u, so it never changes the order of
-            # different u values nor any decision.
-            spread = good_val.quantile(0.75) - good_val.quantile(0.25)
-            distance = (s - good_val.median()).abs() / spread
-            ranking = u + 0.1 * distance / (1 + distance)
+        if two_sided:  # for AUROC / ROC only: u with its ties at 100 broken (decisions use u)
+            ranking = pd.Series(two_sided_score(s, good_val), index=info.index)
         else:
             ranking = s  # higher = more defective already, no ties from the percentile scale
 
@@ -1117,6 +1159,44 @@ def plot_evaluation(
     fig.suptitle(f"{title}:  AUROC {mean['auroc']:.2f},  balanced accuracy {mean['balanced_accuracy']:.2f},  "
                  f"HAR {mean['har']:.2f},  false alarms on good {100 * mean['false_alarms_good']:.0f} %  "
                  "(mean over 4 runs)", fontsize=13)
+    return fig
+
+
+def plot_detection_heatmap(summary: pd.DataFrame, label_order: list[str], title: str) -> plt.Figure:
+    """Compare many methods: % flagged per label as a heat map, next to each method's AUROC.
+
+    Args:
+        summary (pd.DataFrame): one row per method, with a column "method" (row name, e.g.
+            "vol | whole"), one column per label with the % flagged (mean over runs), and the
+            columns auroc and auroc_sd.
+        label_order (list[str]): label columns from left to right, e.g. ["good", "blur_light", ...].
+        title (str): figure title.
+
+    Returns:
+        plt.Figure: left, the heat map (rows = methods, columns = labels; the good column is the
+            false-alarm rate, the others the detection rate); right, AUROC (mean +- SD over runs).
+    """
+    values = summary[label_order].to_numpy(dtype=float)
+    n = len(summary)
+    fig, (ax_map, ax_auc) = plt.subplots(1, 2, figsize=(18, 0.32 * n + 2.5), constrained_layout=True,
+                                         gridspec_kw={"width_ratios": [4, 1]}, sharey=True)
+    ax_map.imshow(values, cmap="Blues", vmin=0, vmax=100, aspect="auto")
+    for i in range(n):
+        for j in range(len(label_order)):
+            ax_map.text(j, i, f"{values[i, j]:.0f}", ha="center", va="center", fontsize=8,
+                        color="white" if values[i, j] > 60 else "#0b0b0b")
+    ax_map.set_xticks(range(len(label_order)), ["good\n(false alarms)"] + label_order[1:], rotation=45,
+                      ha="right")
+    ax_map.set_yticks(range(n), summary["method"])
+    ax_map.add_patch(Rectangle((-0.5, -0.5), 1, n, fill=False, ec=REFERENCE_COLOUR, lw=2))  # good column
+    ax_map.set_title("% of images flagged per label (mean over 4 runs)")
+
+    ax_auc.barh(range(n), summary["auroc"], xerr=summary["auroc_sd"], color=SERIES_COLOUR,
+                error_kw=dict(ecolor="#52514e", lw=1, capsize=2))
+    ax_auc.axvline(0.5, ls="--", lw=1, color=REFERENCE_COLOUR)  # chance level
+    ax_auc.set(xlim=(0.4, 1.0), xlabel="AUROC (mean ± SD)", title="AUROC")
+    ax_auc.spines[["top", "right"]].set_visible(False)
+    fig.suptitle(title, fontsize=13)
     return fig
 
 
@@ -1868,6 +1948,56 @@ mean_hists_whole = (data["WHOLE_FEATURES"].assign(label=data["WHOLE_FEATURES"]["
 fig = plot_label_histograms(mean_hists_whole,
                             "Average histograms over all WHOLE PICTURES of every label (768 x 576 px)")
 save_figure(fig, RESULTS_DIR / "histograms_all_whole.png", OVERWRITE)
+plt.show()
+
+# %% [markdown]
+# ## Single features
+#
+# Every one of the 19 single-value features used alone as a detector, with the same evaluation as
+# the plain variance of the Laplacian (4 runs, 95th-percentile cut on the good validation images).
+# Each feature is tried on three inputs:
+# - **whole**: the feature of the whole picture (768 x 576), two-sided;
+# - **tiles max**: every tile is scored against the good validation tiles (two-sided, 0-100), and the
+#   image gets the score of its most unusual tile;
+# - **tiles mean**: the same, but the image gets the mean of its 12 tile scores.
+#
+# For example, with VoL and "tiles max", a bubbles image with one very sharp tile (crowded globules at
+# the bubble edge) gets that tile's high score, even if its other 11 tiles look normal.
+#
+# Result: a table of the best feature/input pairs and a heat map of the % flagged per label for all
+# 57 combinations (good column = false alarms, other columns = defects detected).
+
+# %%
+single_features = [c for c in data["WHOLE_FEATURES"].columns if c != "file" and not c.startswith("hist_")]
+whole_by_file = data["WHOLE_FEATURES"].set_index("file")
+single_rows = []
+for feature in tqdm(single_features, desc="single features"):
+    inputs = {"whole": (pd.DataFrame({run: whole_by_file[feature] for run in FOLDS}), True)}
+    for agg in ("max", "mean"):
+        inputs[f"tiles {agg}"] = (tile_image_scores(data["TILE_FEATURES"], feature, eval_info, agg), False)
+    for input_name, (scores, two_sided) in inputs.items():
+        metrics, predictions = evaluate_method(scores, eval_info, two_sided)
+        flagged_pct = detection_table(predictions, eval_labels)["flagged_pct_mean"]
+        single_rows.append({
+            "method": f"{feature} | {input_name}", "feature": feature, "input": input_name,
+            "auroc": metrics["auroc"].mean(), "auroc_sd": metrics["auroc"].std(),
+            "balanced_accuracy": metrics["balanced_accuracy"].mean(), "har": metrics["har"].mean(),
+            "false_alarms_pct": 100 * metrics["false_alarms_good"].mean(),
+            "false_alarms_sd_pct": 100 * metrics["false_alarms_good"].std(),
+            **flagged_pct.to_dict(),
+        })
+data["SINGLE_FEATURES"] = pd.DataFrame(single_rows)
+save_table(data["SINGLE_FEATURES"].round(4), RESULTS_DIR / "single_features_summary.csv", OVERWRITE)
+
+print("The 15 best feature/input pairs by AUROC (mean over 4 runs):")
+data["SINGLE_FEATURES"].sort_values("auroc", ascending=False).head(15)[
+    ["method", "auroc", "auroc_sd", "balanced_accuracy", "har", "false_alarms_pct", "false_alarms_sd_pct"]
+].round(3)
+
+# %%
+fig = plot_detection_heatmap(data["SINGLE_FEATURES"], eval_labels,
+                             "Single features as detectors: whole picture vs tiles (max / mean of 12 tiles)")
+save_figure(fig, RESULTS_DIR / "single_features_heatmap.png", OVERWRITE)
 plt.show()
 
 # %% [markdown]
