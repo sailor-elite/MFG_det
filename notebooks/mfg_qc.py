@@ -35,7 +35,10 @@ from matplotlib.patches import Rectangle
 from skimage.feature import local_binary_pattern
 from skimage.filters import threshold_otsu
 from sklearn.covariance import LedoitWolf
-from sklearn.ensemble import IsolationForest
+from lightgbm import LGBMClassifier
+from sklearn.ensemble import HistGradientBoostingClassifier, IsolationForest, RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.pipeline import make_pipeline
 from sklearn.metrics import roc_auc_score, roc_curve
 from sklearn.neighbors import LocalOutlierFactor
 from sklearn.preprocessing import StandardScaler
@@ -196,6 +199,17 @@ ONE_CLASS_DETECTORS = {
     "One-Class SVM": lambda: OneClassSVM(kernel="rbf", gamma="scale", nu=0.05),  # boundary around good
     "Isolation Forest": lambda: IsolationForest(n_estimators=200, random_state=SEED),  # how easy to isolate
     "LOF": lambda: LocalOutlierFactor(n_neighbors=20, novelty=True),  # density vs the 20 nearest good
+}
+
+# Supervised models on all 95 features (CLAUDE.md §9 Step 3b): learn from good AND defective training
+# images; class weights balance good vs defective; default settings (no tuning).
+SUPERVISED_MODELS = {
+    "Logistic regression": lambda: make_pipeline(
+        StandardScaler(), LogisticRegression(max_iter=3000, class_weight="balanced")),
+    "Random forest": lambda: RandomForestClassifier(
+        n_estimators=300, class_weight="balanced", n_jobs=DATA_WORKERS, random_state=SEED),
+    "HistGradientBoosting": lambda: HistGradientBoostingClassifier(class_weight="balanced", random_state=SEED),
+    "LightGBM": lambda: LGBMClassifier(class_weight="balanced", n_jobs=DATA_WORKERS, random_state=SEED, verbose=-1),
 }
 
 data = {}
@@ -1308,10 +1322,58 @@ def run_one_class_detectors(
         dict[tuple[str, str], pd.DataFrame]: (detector name, input) -> image scores (index = file,
             columns = runs 1-4); input is "whole", "tiles max" (most unusual tile) or "tiles mean".
     """
+    return run_models(detectors, whole, tiles, info, one_class_scores)
+
+
+def supervised_scores(table: pd.DataFrame, info: pd.DataFrame, make_model) -> pd.DataFrame:
+    """Train a classifier (good vs defective) on the training rows of every run and score all rows.
+
+    In every run the model learns from all training rows (good and defective images of the two
+    training folds; tiles get the label of their image) and then gives every row its probability of
+    being defective.
+
+    Args:
+        table (pd.DataFrame): one row per whole picture or per tile, with a column "file" and the
+            95 feature columns (a "tile_idx" column is ignored), e.g. data["WHOLE_FEATURES"].
+        info (pd.DataFrame): index = file, columns fold and is_defect (images that are not excluded).
+        make_model (callable): makes a new untrained classifier, e.g. SUPERVISED_MODELS["LightGBM"].
+
+    Returns:
+        pd.DataFrame: same index as table, one column per run (1-4) with P(defective), 0-1.
+    """
+    feature_cols = [c for c in table.columns if c not in ("file", "tile_idx")]
+    x = table[feature_cols].to_numpy(dtype=float)
+    fold = table["file"].map(info["fold"])
+    y = table["file"].map(info["is_defect"]).astype(int).to_numpy()
+    scores = {}
+    for run in FOLDS:
+        train = (run_roles(fold, run) == "train").to_numpy()
+        model = make_model()
+        model.fit(x[train], y[train])
+        scores[run] = model.predict_proba(x)[:, 1]
+    return pd.DataFrame(scores, index=table.index)
+
+
+def run_models(
+    models: dict, whole: pd.DataFrame, tiles: pd.DataFrame, info: pd.DataFrame, score_fn
+) -> dict[tuple[str, str], pd.DataFrame]:
+    """Run every model on whole pictures and on tiles, and return image scores per run.
+
+    Args:
+        models (dict): name -> function that makes a new model, e.g. SUPERVISED_MODELS.
+        whole (pd.DataFrame): whole-picture features, e.g. data["WHOLE_FEATURES"].
+        tiles (pd.DataFrame): tile features, e.g. data["TILE_FEATURES"].
+        info (pd.DataFrame): index = file, columns fold, label, is_defect.
+        score_fn (callable): one_class_scores or supervised_scores (table, info, make) -> scores per run.
+
+    Returns:
+        dict[tuple[str, str], pd.DataFrame]: (model name, input) -> image scores (index = file,
+            columns = runs 1-4); input is "whole", "tiles max" or "tiles mean".
+    """
     results = {}
-    for name, make in tqdm(detectors.items(), desc="detectors"):
-        results[(name, "whole")] = one_class_scores(whole, info, make).set_axis(whole["file"].to_numpy())
-        tile_scores = one_class_scores(tiles, info, make)
+    for name, make in tqdm(models.items(), desc="models"):
+        results[(name, "whole")] = score_fn(whole, info, make).set_axis(whole["file"].to_numpy())
+        tile_scores = score_fn(tiles, info, make)
         for agg in ("max", "mean"):
             results[(name, f"tiles {agg}")] = tile_scores.groupby(tiles["file"].to_numpy()).agg(agg)
     return results
@@ -2206,6 +2268,68 @@ best_key = tuple(best_method.split(" | "))
 fig = plot_evaluation(*one_class_results[best_key], eval_labels, f"Best one-class model: {best_method}")
 save_figure(fig, RESULTS_DIR / "one_class_best.png", OVERWRITE)
 plt.show()
+
+# %% [markdown]
+# ## Supervised models (good vs defective)
+#
+# Four classifiers on all 95 features that learn from **good and defective** training images (two
+# folds per run), so they can learn what bubbles or undiluted fields look like, which the one-class
+# models never see. Class weights balance the ~300 good against ~1,400 defective training images;
+# default settings, no tuning:
+# - **Logistic regression**: a weighted sum of the (standardised) features;
+# - **Random forest**: 300 decision trees that vote;
+# - **HistGradientBoosting** and **LightGBM**: trees added one after another, each fixing the
+#   mistakes of the previous ones.
+#
+# For tiles, every tile gets the label of its image (a bubbles image has 12 "defective" tiles even if
+# only some show the bubble); the image then gets the max or mean of its 12 tile probabilities.
+# Each model gives P(defective); it is judged with the same rule as everything else (95th percentile of
+# the good validation images, 4 runs), not with the usual 0.5.
+#
+# Result: a comparison table, the heat map, the best model's evaluation figure, and the best method of
+# each family so far.
+
+# %%
+supervised_image_scores = load_or_compute(
+    CACHE_DIR / "supervised_scores.pkl",
+    lambda: run_models(SUPERVISED_MODELS, data["WHOLE_FEATURES"], data["TILE_FEATURES"], eval_info,
+                       supervised_scores),
+    USE_SAVED_RESULTS,
+)
+supervised_results = {
+    key: evaluate_method(scores, eval_info, two_sided=False) for key, scores in supervised_image_scores.items()
+}
+data["SUPERVISED"] = pd.DataFrame([
+    summary_row(f"{name} | {input_name}", metrics, predictions, eval_labels)
+    for (name, input_name), (metrics, predictions) in supervised_results.items()
+])
+save_table(data["SUPERVISED"].round(4), RESULTS_DIR / "supervised_summary.csv", OVERWRITE)
+data["SUPERVISED"].sort_values("auroc", ascending=False)[
+    ["method", "auroc", "auroc_sd", "balanced_accuracy", "har", "false_alarms_pct", "false_alarms_sd_pct"]
+].round(3)
+
+# %%
+fig = plot_detection_heatmap(data["SUPERVISED"], eval_labels,
+                             "Supervised models on all 95 features (trained on good and defective images)")
+save_figure(fig, RESULTS_DIR / "supervised_heatmap.png", OVERWRITE)
+plt.show()
+
+# %%
+# Full evaluation figure of the best supervised model (highest mean AUROC)
+best_supervised = data["SUPERVISED"].sort_values("auroc", ascending=False)["method"].iloc[0]
+fig = plot_evaluation(*supervised_results[tuple(best_supervised.split(" | "))], eval_labels,
+                      f"Best supervised model: {best_supervised}")
+save_figure(fig, RESULTS_DIR / "supervised_best.png", OVERWRITE)
+plt.show()
+
+# %%
+# Best method of every family so far (highest mean AUROC), with its detection per label
+family_best = pd.concat([
+    table.sort_values("auroc", ascending=False).head(1).assign(family=family)
+    for family, table in [("single feature", data["SINGLE_FEATURES"]), ("one-class", data["ONE_CLASS"]),
+                          ("supervised", data["SUPERVISED"])]
+]).set_index("family")
+family_best[["method", "auroc", "balanced_accuracy", "har", "false_alarms_pct"] + eval_labels[1:]].round(2)
 
 # %% [markdown]
 # # Experiments
