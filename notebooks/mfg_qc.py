@@ -34,7 +34,12 @@ import pandas as pd
 from matplotlib.patches import Rectangle
 from skimage.feature import local_binary_pattern
 from skimage.filters import threshold_otsu
+from sklearn.covariance import LedoitWolf
+from sklearn.ensemble import IsolationForest
 from sklearn.metrics import roc_auc_score, roc_curve
+from sklearn.neighbors import LocalOutlierFactor
+from sklearn.preprocessing import StandardScaler
+from sklearn.svm import OneClassSVM
 from tqdm import tqdm
 
 # %%
@@ -183,6 +188,15 @@ FOLDS = {
 VALIDATION_FOLD = {k: k % len(FOLDS) + 1 for k in FOLDS}  # {1: 2, 2: 3, 3: 4, 4: 1}
 FLAG_PERCENTILE = 95  # flag an image when it is more unusual than 95 % of good validation images
 RUN_COLOURS = {1: "#2a78d6", 2: "#eb6834", 3: "#1baf7a", 4: "#eda100"}  # one colour per run in figures
+
+# One-class models on all 95 features (CLAUDE.md §9 Step 3c): trained on good images only,
+# default settings (no tuning). Each entry makes a new, untrained detector.
+ONE_CLASS_DETECTORS = {
+    "Mahalanobis": lambda: LedoitWolf(),  # distance from the average good image (stabilised covariance)
+    "One-Class SVM": lambda: OneClassSVM(kernel="rbf", gamma="scale", nu=0.05),  # boundary around good
+    "Isolation Forest": lambda: IsolationForest(n_estimators=200, random_state=SEED),  # how easy to isolate
+    "LOF": lambda: LocalOutlierFactor(n_neighbors=20, novelty=True),  # density vs the 20 nearest good
+}
 
 data = {}
 
@@ -1232,6 +1246,100 @@ def plot_detection_heatmap(summary: pd.DataFrame, label_order: list[str], title:
     return fig
 
 
+def anomaly_scores(detector, x: np.ndarray) -> np.ndarray:
+    """Return the anomaly score of every row (higher = more unusual) for scikit-learn and PyOD detectors.
+
+    Args:
+        detector: a trained detector, e.g. LedoitWolf, OneClassSVM, IsolationForest,
+            LocalOutlierFactor(novelty=True), or any PyOD detector.
+        x (np.ndarray): standardised features, shape (n_rows, n_features), e.g. (47592, 95).
+
+    Returns:
+        np.ndarray: shape (n_rows,), higher = less like the good training images.
+    """
+    if hasattr(detector, "mahalanobis"):        # scikit-learn covariance: squared Mahalanobis distance
+        return detector.mahalanobis(x)
+    if hasattr(detector, "decision_scores_"):   # PyOD: decision_function is already "higher = unusual"
+        return detector.decision_function(x)
+    return -detector.score_samples(x)           # scikit-learn: score_samples is "higher = normal"
+
+
+def one_class_scores(table: pd.DataFrame, info: pd.DataFrame, make_detector) -> pd.DataFrame:
+    """Train a one-class detector on the good training rows of every run and score all rows.
+
+    In every run: the features are standardised with the mean and SD of the good training rows,
+    the detector learns from those rows only, and then scores every row.
+
+    Args:
+        table (pd.DataFrame): one row per whole picture or per tile, with a column "file" and the
+            95 feature columns (a "tile_idx" column is ignored), e.g. data["WHOLE_FEATURES"].
+        info (pd.DataFrame): index = file, columns fold and label (images that are not excluded).
+        make_detector (callable): makes a new untrained detector, e.g. ONE_CLASS_DETECTORS["LOF"].
+
+    Returns:
+        pd.DataFrame: same index as table, one column per run (1-4) with the anomaly score.
+    """
+    feature_cols = [c for c in table.columns if c not in ("file", "tile_idx")]
+    x_all = table[feature_cols].to_numpy(dtype=float)
+    fold, label = table["file"].map(info["fold"]), table["file"].map(info["label"])
+    scores = {}
+    for run in FOLDS:
+        train_good = ((run_roles(fold, run) == "train") & (label == "good")).to_numpy()
+        scaler = StandardScaler().fit(x_all[train_good])
+        x = scaler.transform(x_all)
+        detector = make_detector()
+        detector.fit(x[train_good])
+        scores[run] = anomaly_scores(detector, x)
+    return pd.DataFrame(scores, index=table.index)
+
+
+def run_one_class_detectors(
+    detectors: dict, whole: pd.DataFrame, tiles: pd.DataFrame, info: pd.DataFrame
+) -> dict[tuple[str, str], pd.DataFrame]:
+    """Run every detector on whole pictures and on tiles, and return image scores per run.
+
+    Args:
+        detectors (dict): name -> function that makes a new detector, e.g. ONE_CLASS_DETECTORS.
+        whole (pd.DataFrame): whole-picture features, e.g. data["WHOLE_FEATURES"].
+        tiles (pd.DataFrame): tile features, e.g. data["TILE_FEATURES"].
+        info (pd.DataFrame): index = file, columns fold and label.
+
+    Returns:
+        dict[tuple[str, str], pd.DataFrame]: (detector name, input) -> image scores (index = file,
+            columns = runs 1-4); input is "whole", "tiles max" (most unusual tile) or "tiles mean".
+    """
+    results = {}
+    for name, make in tqdm(detectors.items(), desc="detectors"):
+        results[(name, "whole")] = one_class_scores(whole, info, make).set_axis(whole["file"].to_numpy())
+        tile_scores = one_class_scores(tiles, info, make)
+        for agg in ("max", "mean"):
+            results[(name, f"tiles {agg}")] = tile_scores.groupby(tiles["file"].to_numpy()).agg(agg)
+    return results
+
+
+def summary_row(method: str, metrics: pd.DataFrame, predictions: pd.DataFrame, label_order: list[str]) -> dict:
+    """Return one row of a method comparison table (means over the runs and % flagged per label).
+
+    Args:
+        method (str): name of the method, e.g. "LOF | tiles max".
+        metrics (pd.DataFrame): from evaluate_method.
+        predictions (pd.DataFrame): from evaluate_method.
+        label_order (list[str]): labels, e.g. ["good", "blur_light", ...].
+
+    Returns:
+        dict: method, auroc, auroc_sd, balanced_accuracy, har, false_alarms_pct,
+            false_alarms_sd_pct and the % flagged for every label.
+    """
+    return {
+        "method": method,
+        "auroc": metrics["auroc"].mean(), "auroc_sd": metrics["auroc"].std(),
+        "balanced_accuracy": metrics["balanced_accuracy"].mean(), "har": metrics["har"].mean(),
+        "false_alarms_pct": 100 * metrics["false_alarms_good"].mean(),
+        "false_alarms_sd_pct": 100 * metrics["false_alarms_good"].std(),
+        **detection_table(predictions, label_order)["flagged_pct_mean"].to_dict(),
+    }
+
+
 # %% [markdown]
 # # Loading data
 
@@ -2047,6 +2155,56 @@ data["SINGLE_FEATURES"].sort_values("auroc", ascending=False).head(15)[
 fig = plot_detection_heatmap(data["SINGLE_FEATURES"], eval_labels,
                              "Single features as detectors: whole picture vs tiles (max / mean of 12 tiles)")
 save_figure(fig, RESULTS_DIR / "single_features_heatmap.png", OVERWRITE)
+plt.show()
+
+# %% [markdown]
+# ## One-class models
+#
+# Four detectors that use **all 95 features at once** and learn **only from good images** of the
+# training slides (two folds per run). Default settings, no tuning:
+# - **Mahalanobis**: distance of an image from the average good image, taking into account how the
+#   features vary together (Ledoit-Wolf: a stabilised version for 95 features and few images);
+# - **One-Class SVM**: draws a boundary around the good images; outside = unusual;
+# - **Isolation Forest**: random splits of the features; unusual images are isolated in few splits;
+# - **LOF**: compares how crowded an image's neighbourhood is with that of its 20 nearest good images.
+#
+# Each detector gives an anomaly score (higher = less like good). It is tried on the whole picture
+# and on tiles (score of the most unusual tile, or the mean of the 12 tiles), and evaluated exactly
+# like the single features: 95th-percentile cut on the good validation images, 4 runs.
+#
+# Result: a comparison table, the heat map of % flagged per label, and the full evaluation figure of
+# the best detector.
+
+# %%
+one_class_image_scores = load_or_compute(
+    CACHE_DIR / "one_class_scores.pkl",
+    lambda: run_one_class_detectors(ONE_CLASS_DETECTORS, data["WHOLE_FEATURES"], data["TILE_FEATURES"], eval_info),
+    USE_SAVED_RESULTS,
+)
+one_class_results = {
+    key: evaluate_method(scores, eval_info, two_sided=False) for key, scores in one_class_image_scores.items()
+}
+data["ONE_CLASS"] = pd.DataFrame([
+    summary_row(f"{name} | {input_name}", metrics, predictions, eval_labels)
+    for (name, input_name), (metrics, predictions) in one_class_results.items()
+])
+save_table(data["ONE_CLASS"].round(4), RESULTS_DIR / "one_class_summary.csv", OVERWRITE)
+data["ONE_CLASS"].sort_values("auroc", ascending=False)[
+    ["method", "auroc", "auroc_sd", "balanced_accuracy", "har", "false_alarms_pct", "false_alarms_sd_pct"]
+].round(3)
+
+# %%
+fig = plot_detection_heatmap(data["ONE_CLASS"], eval_labels,
+                             "One-class models on all 95 features (trained on good images only)")
+save_figure(fig, RESULTS_DIR / "one_class_heatmap.png", OVERWRITE)
+plt.show()
+
+# %%
+# Full evaluation figure of the best one-class detector (highest mean AUROC)
+best_method = data["ONE_CLASS"].sort_values("auroc", ascending=False)["method"].iloc[0]
+best_key = tuple(best_method.split(" | "))
+fig = plot_evaluation(*one_class_results[best_key], eval_labels, f"Best one-class model: {best_method}")
+save_figure(fig, RESULTS_DIR / "one_class_best.png", OVERWRITE)
 plt.show()
 
 # %% [markdown]
