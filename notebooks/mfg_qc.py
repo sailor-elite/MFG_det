@@ -8,7 +8,7 @@
 #       format_version: '1.3'
 #       jupytext_version: 1.19.6
 #   kernelspec:
-#     display_name: mfg-qc (3.11.x)
+#     display_name: mfg-qc (3.11.18)
 #     language: python
 #     name: python3
 # ---
@@ -224,8 +224,8 @@ SUPERVISED_MODELS = {
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DEEP_BACKBONES = {  # short name -> timm model name
     "resnet18": "resnet18.a1_in1k",               # ImageNet CNN; last two stages, averaged: 256 + 512 values
-    # Later (about 2 h on the GTX 1650, resumable in chunks of 200 images), e.g. overnight:
-    # "dinov2_vits14": "vit_small_patch14_dinov2.lvd142m",  # self-supervised ViT; summary + mean patch token: 384 + 384
+    # about 2 h on the GTX 1650 the first time (resumable in chunks of 200 images):
+    "dinov2_vits14": "vit_small_patch14_dinov2.lvd142m",  # self-supervised ViT; summary + mean patch token: 384 + 384
 }
 DEEP_FEATURES_DIR = Path("/home/qq/mfg_qc/data/features/deep")  # saved chunks per backbone (git-ignored)
 DEEP_BATCH_IMAGES = 4  # images per GPU batch (each = 12 tiles + 1 whole picture)
@@ -1296,7 +1296,8 @@ def anomaly_scores(detector, x: np.ndarray) -> np.ndarray:
     return -detector.score_samples(x)           # scikit-learn: score_samples is "higher = normal"
 
 
-def one_class_scores(table: pd.DataFrame, info: pd.DataFrame, make_detector) -> pd.DataFrame:
+def one_class_scores(table: pd.DataFrame, info: pd.DataFrame, make_detector,
+                     progress: tqdm | None = None, step: str = "") -> pd.DataFrame:
     """Train a one-class detector on the good training rows of every run and score all rows.
 
     In every run: the features are standardised with the mean and SD of the good training rows,
@@ -1304,9 +1305,11 @@ def one_class_scores(table: pd.DataFrame, info: pd.DataFrame, make_detector) -> 
 
     Args:
         table (pd.DataFrame): one row per whole picture or per tile, with a column "file" and the
-            95 feature columns (a "tile_idx" column is ignored), e.g. data["WHOLE_FEATURES"].
+            feature columns (a "tile_idx" column is ignored), e.g. data["WHOLE_FEATURES"].
         info (pd.DataFrame): index = file, columns fold and label (images that are not excluded).
         make_detector (callable): makes a new untrained detector, e.g. ONE_CLASS_DETECTORS["LOF"].
+        progress (tqdm | None): progress bar to advance by one step per run (None = no progress shown).
+        step (str): what is trained, shown next to the bar, e.g. "LOF | tiles".
 
     Returns:
         pd.DataFrame: same index as table, one column per run (1-4) with the anomaly score.
@@ -1316,17 +1319,21 @@ def one_class_scores(table: pd.DataFrame, info: pd.DataFrame, make_detector) -> 
     fold, label = table["file"].map(info["fold"]), table["file"].map(info["label"])
     scores = {}
     for run in FOLDS:
+        if progress is not None:
+            progress.set_postfix_str(f"{step} | run {run} of {len(FOLDS)}")
         train_good = ((run_roles(fold, run) == "train") & (label == "good")).to_numpy()
         scaler = StandardScaler().fit(x_all[train_good])
         x = scaler.transform(x_all)
         detector = make_detector()
         detector.fit(x[train_good])
         scores[run] = anomaly_scores(detector, x)
+        if progress is not None:
+            progress.update(1)
     return pd.DataFrame(scores, index=table.index)
 
 
 def run_one_class_detectors(
-    detectors: dict, whole: pd.DataFrame, tiles: pd.DataFrame, info: pd.DataFrame
+    detectors: dict, whole: pd.DataFrame, tiles: pd.DataFrame, info: pd.DataFrame, desc: str = "one-class"
 ) -> dict[tuple[str, str], pd.DataFrame]:
     """Run every detector on whole pictures and on tiles, and return image scores per run.
 
@@ -1335,15 +1342,17 @@ def run_one_class_detectors(
         whole (pd.DataFrame): whole-picture features, e.g. data["WHOLE_FEATURES"].
         tiles (pd.DataFrame): tile features, e.g. data["TILE_FEATURES"].
         info (pd.DataFrame): index = file, columns fold and label.
+        desc (str): label of the progress bar, e.g. "handcrafted one-class".
 
     Returns:
         dict[tuple[str, str], pd.DataFrame]: (detector name, input) -> image scores (index = file,
             columns = runs 1-4); input is "whole", "tiles max" (most unusual tile) or "tiles mean".
     """
-    return run_models(detectors, whole, tiles, info, one_class_scores)
+    return run_models(detectors, whole, tiles, info, one_class_scores, desc)
 
 
-def supervised_scores(table: pd.DataFrame, info: pd.DataFrame, make_model) -> pd.DataFrame:
+def supervised_scores(table: pd.DataFrame, info: pd.DataFrame, make_model,
+                      progress: tqdm | None = None, step: str = "") -> pd.DataFrame:
     """Train a classifier (good vs defective) on the training rows of every run and score all rows.
 
     In every run the model learns from all training rows (good and defective images of the two
@@ -1352,9 +1361,11 @@ def supervised_scores(table: pd.DataFrame, info: pd.DataFrame, make_model) -> pd
 
     Args:
         table (pd.DataFrame): one row per whole picture or per tile, with a column "file" and the
-            95 feature columns (a "tile_idx" column is ignored), e.g. data["WHOLE_FEATURES"].
+            feature columns (a "tile_idx" column is ignored), e.g. data["WHOLE_FEATURES"].
         info (pd.DataFrame): index = file, columns fold and is_defect (images that are not excluded).
         make_model (callable): makes a new untrained classifier, e.g. SUPERVISED_MODELS["LightGBM"].
+        progress (tqdm | None): progress bar to advance by one step per run (None = no progress shown).
+        step (str): what is trained, shown next to the bar, e.g. "Random forest | tiles".
 
     Returns:
         pd.DataFrame: same index as table, one column per run (1-4) with P(defective), 0-1.
@@ -1365,35 +1376,46 @@ def supervised_scores(table: pd.DataFrame, info: pd.DataFrame, make_model) -> pd
     y = table["file"].map(info["is_defect"]).astype(int).to_numpy()
     scores = {}
     for run in FOLDS:
+        if progress is not None:
+            progress.set_postfix_str(f"{step} | run {run} of {len(FOLDS)}")
         train = (run_roles(fold, run) == "train").to_numpy()
         model = make_model()
         model.fit(x[train], y[train])
         scores[run] = model.predict_proba(x)[:, 1]
+        if progress is not None:
+            progress.update(1)
     return pd.DataFrame(scores, index=table.index)
 
 
 def run_models(
-    models: dict, whole: pd.DataFrame, tiles: pd.DataFrame, info: pd.DataFrame, score_fn
+    models: dict, whole: pd.DataFrame, tiles: pd.DataFrame, info: pd.DataFrame, score_fn, desc: str = "models"
 ) -> dict[tuple[str, str], pd.DataFrame]:
     """Run every model on whole pictures and on tiles, and return image scores per run.
+
+    The progress bar counts every training: models x 2 inputs (whole, tiles) x 4 runs, and shows
+    next to it what is trained right now, e.g. "Random forest | tiles | run 2 of 4".
 
     Args:
         models (dict): name -> function that makes a new model, e.g. SUPERVISED_MODELS.
         whole (pd.DataFrame): whole-picture features, e.g. data["WHOLE_FEATURES"].
         tiles (pd.DataFrame): tile features, e.g. data["TILE_FEATURES"].
         info (pd.DataFrame): index = file, columns fold, label, is_defect.
-        score_fn (callable): one_class_scores or supervised_scores (table, info, make) -> scores per run.
+        score_fn (callable): one_class_scores or supervised_scores.
+        desc (str): label of the progress bar, e.g. "resnet18 supervised".
 
     Returns:
         dict[tuple[str, str], pd.DataFrame]: (model name, input) -> image scores (index = file,
             columns = runs 1-4); input is "whole", "tiles max" or "tiles mean".
     """
     results = {}
-    for name, make in tqdm(models.items(), desc="models"):
-        results[(name, "whole")] = score_fn(whole, info, make).set_axis(whole["file"].to_numpy())
-        tile_scores = score_fn(tiles, info, make)
+    progress = tqdm(total=len(models) * 2 * len(FOLDS), desc=desc, unit="step")
+    for name, make in models.items():
+        whole_scores = score_fn(whole, info, make, progress, f"{name} | whole")
+        results[(name, "whole")] = whole_scores.set_axis(whole["file"].to_numpy())
+        tile_scores = score_fn(tiles, info, make, progress, f"{name} | tiles")
         for agg in ("max", "mean"):
             results[(name, f"tiles {agg}")] = tile_scores.groupby(tiles["file"].to_numpy()).agg(agg)
+    progress.close()
     return results
 
 
@@ -1421,15 +1443,18 @@ def summary_row(method: str, metrics: pd.DataFrame, predictions: pd.DataFrame, l
 
 
 def multiclass_probabilities(
-    table: pd.DataFrame, info: pd.DataFrame, make_model, classes: list[str]
+    table: pd.DataFrame, info: pd.DataFrame, make_model, classes: list[str],
+    progress: tqdm | None = None, step: str = "",
 ) -> dict[int, np.ndarray]:
     """Train a multi-class model (which label?) on the training rows of every run; return probabilities.
 
     Args:
-        table (pd.DataFrame): one row per whole picture or tile, with "file" and the 95 feature columns.
+        table (pd.DataFrame): one row per whole picture or tile, with "file" and the feature columns.
         info (pd.DataFrame): index = file, columns fold and label (images that are not excluded).
         make_model (callable): makes a new untrained classifier, e.g. SUPERVISED_MODELS["LightGBM"].
         classes (list[str]): the labels the model can choose, e.g. good + the 10 defect types.
+        progress (tqdm | None): progress bar to advance by one step per run (None = no progress shown).
+        step (str): what is trained, shown next to the bar, e.g. "LightGBM | whole".
 
     Returns:
         dict[int, np.ndarray]: run (1-4) -> probabilities of shape (n_rows, n_classes), columns in
@@ -1440,25 +1465,33 @@ def multiclass_probabilities(
     fold, label = table["file"].map(info["fold"]), table["file"].map(info["label"])
     probabilities = {}
     for run in FOLDS:
+        if progress is not None:
+            progress.set_postfix_str(f"{step} | run {run} of {len(FOLDS)}")
         train = ((run_roles(fold, run) == "train") & label.isin(classes)).to_numpy()
         model = make_model()
         model.fit(x[train], label[train].to_numpy())
         proba = model.predict_proba(x)
         order = [list(model.classes_).index(c) for c in classes]  # reorder columns to `classes`
         probabilities[run] = proba[:, order]
+        if progress is not None:
+            progress.update(1)
     return probabilities
 
 
 def run_multiclass_models(
-    models: dict, whole: pd.DataFrame, tiles: pd.DataFrame, info: pd.DataFrame, classes: list[str]
+    models: dict, whole: pd.DataFrame, tiles: pd.DataFrame, info: pd.DataFrame, classes: list[str],
+    desc: str = "defect type",
 ) -> dict[tuple[str, str], dict[int, pd.DataFrame]]:
     """Run every multi-class model on whole pictures and on tiles; return image probabilities per run.
+
+    The progress bar counts every training (models x 2 inputs x 4 runs) and shows what is trained now.
 
     Args:
         models (dict): name -> function that makes a new classifier, e.g. SUPERVISED_MODELS.
         whole (pd.DataFrame): whole-picture features. tiles (pd.DataFrame): tile features.
         info (pd.DataFrame): index = file, columns fold and label.
         classes (list[str]): the labels to choose from, e.g. good + 10 defect types.
+        desc (str): label of the progress bar, e.g. "handcrafted defect type".
 
     Returns:
         dict: (model name, input) -> {run: DataFrame (index = file, columns = classes) of probabilities}.
@@ -1466,9 +1499,10 @@ def run_multiclass_models(
             label its highest probability over the 12 tiles, which favours local defects).
     """
     results = {}
-    for name, make in tqdm(models.items(), desc="multi-class models"):
-        whole_p = multiclass_probabilities(whole, info, make, classes)
-        tile_p = multiclass_probabilities(tiles, info, make, classes)
+    progress = tqdm(total=len(models) * 2 * len(FOLDS), desc=desc, unit="step")
+    for name, make in models.items():
+        whole_p = multiclass_probabilities(whole, info, make, classes, progress, f"{name} | whole")
+        tile_p = multiclass_probabilities(tiles, info, make, classes, progress, f"{name} | tiles")
         results[(name, "whole")] = {
             run: pd.DataFrame(p, index=whole["file"].to_numpy(), columns=classes) for run, p in whole_p.items()
         }
@@ -1477,6 +1511,7 @@ def run_multiclass_models(
                 run: pd.DataFrame(p, columns=classes).groupby(tiles["file"].to_numpy()).agg(agg)
                 for run, p in tile_p.items()
             }
+    progress.close()
     return results
 
 
@@ -1677,6 +1712,27 @@ def extract_deep_features(paths: list[Path], timm_name: str, batch_images: int, 
     return {"files": [p.name for p in paths],
             "tiles": np.concatenate([p["tiles"] for p in parts]),
             "whole": np.concatenate([p["whole"] for p in parts])}
+
+
+def deep_feature_tables(features: dict) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Turn the deep features of one backbone into the same table format as the handcrafted features.
+
+    Args:
+        features (dict): from extract_deep_features ("files", "tiles" (n, 12, d), "whole" (n, d)).
+
+    Returns:
+        tuple[pd.DataFrame, pd.DataFrame]: whole (one row per image: "file" + d feature columns
+            "d000", "d001", ...) and tiles (one row per tile: "file", "tile_idx" + the same columns),
+            ready for run_models().
+    """
+    n, n_tiles, d = features["tiles"].shape
+    columns = [f"d{i:03d}" for i in range(d)]
+    whole = pd.DataFrame(features["whole"], columns=columns)
+    whole.insert(0, "file", features["files"])
+    tiles = pd.DataFrame(features["tiles"].reshape(n * n_tiles, d), columns=columns)
+    tiles.insert(0, "file", np.repeat(features["files"], n_tiles))
+    tiles.insert(1, "tile_idx", np.tile(np.arange(n_tiles), n))
+    return whole, tiles
 
 
 # %% [markdown]
@@ -2517,7 +2573,8 @@ plt.show()
 # %%
 one_class_image_scores = load_or_compute(
     CACHE_DIR / "one_class_scores.pkl",
-    lambda: run_one_class_detectors(ONE_CLASS_DETECTORS, data["WHOLE_FEATURES"], data["TILE_FEATURES"], eval_info),
+    lambda: run_one_class_detectors(ONE_CLASS_DETECTORS, data["WHOLE_FEATURES"], data["TILE_FEATURES"], eval_info,
+                                    desc="handcrafted one-class"),
     USE_SAVED_RESULTS,
 )
 one_class_results = {
@@ -2570,7 +2627,7 @@ plt.show()
 supervised_image_scores = load_or_compute(
     CACHE_DIR / "supervised_scores.pkl",
     lambda: run_models(SUPERVISED_MODELS, data["WHOLE_FEATURES"], data["TILE_FEATURES"], eval_info,
-                       supervised_scores),
+                       supervised_scores, desc="handcrafted supervised"),
     USE_SAVED_RESULTS,
 )
 supervised_results = {
@@ -2627,7 +2684,7 @@ t2_classes = [label for label in eval_labels if label not in ("frozen", "uht")] 
 t2_probabilities = load_or_compute(
     CACHE_DIR / "multiclass_probabilities.pkl",
     lambda: run_multiclass_models(SUPERVISED_MODELS, data["WHOLE_FEATURES"], data["TILE_FEATURES"], eval_info,
-                                  t2_classes),
+                                  t2_classes, desc="handcrafted defect type"),
     USE_SAVED_RESULTS,
 )
 t2_results = {key: evaluate_multiclass(p, eval_info, t2_classes) for key, p in t2_probabilities.items()}
@@ -2684,6 +2741,66 @@ pd.DataFrame({
 }).T
 
 # %% [markdown]
+# ## One-class and supervised models on deep features
+#
+# The same one-class models (learn from good images only) and supervised models (learn from good and
+# defective images) as for the handcrafted features, with the same evaluation, but now on the deep
+# features of every backbone in `DEEP_BACKBONES` (768 numbers per tile or whole picture instead of 95).
+# Uncommenting a backbone in Config and running again adds it automatically.
+#
+# Result: a table of all deep-feature methods, the heat map, and the comparison with the best
+# handcrafted-feature methods: **are deep features better than the 95 handcrafted ones?**
+
+# %%
+deep_rows = []     # one summary row per method (backbone x model x input)
+deep_results = {}  # method name -> (metrics per run, predictions), for the figures below
+for backbone, features in deep_features.items():  # every backbone in DEEP_BACKBONES
+    # Deep features as tables like the handcrafted ones: 768 columns d000-d767, per whole picture / per tile
+    whole_table, tile_table = deep_feature_tables(features)
+    for family, models, score_fn in [("one-class", ONE_CLASS_DETECTORS, one_class_scores),
+                                     ("supervised", SUPERVISED_MODELS, supervised_scores)]:
+        # Train every model in all 4 runs on whole pictures and on tiles; saved after the first time.
+        # Progress bar: one step = one model trained on one input in one run (4 models x 2 inputs x 4 runs),
+        # and next to it what is trained right now, e.g. "Random forest | tiles | run 2 of 4".
+        scores = load_or_compute(
+            CACHE_DIR / f"deep_{backbone}_{family}.pkl",
+            lambda: run_models(models, whole_table, tile_table, eval_info, score_fn, desc=f"{backbone} {family}"),
+            USE_SAVED_RESULTS,
+        )
+        # Same evaluation as everything else: 95th-percentile cut on good validation images, 4 runs
+        for (name, input_name), image_scores in scores.items():
+            method = f"{backbone} {name} | {input_name}"
+            deep_results[method] = evaluate_method(image_scores, eval_info, two_sided=False)
+            deep_rows.append({"family": f"deep {family}", **summary_row(method, *deep_results[method], eval_labels)})
+data["DEEP"] = pd.DataFrame(deep_rows)
+save_table(data["DEEP"].round(4), RESULTS_DIR / "deep_features_summary.csv", OVERWRITE)
+data["DEEP"].sort_values("auroc", ascending=False)[
+    ["family", "method", "auroc", "auroc_sd", "balanced_accuracy", "har", "false_alarms_pct", "false_alarms_sd_pct"]
+].head(15).round(3)
+
+# %%
+fig = plot_detection_heatmap(data["DEEP"], eval_labels,
+                             "One-class and supervised models on deep features (pretrained networks)")
+save_figure(fig, RESULTS_DIR / "deep_features_heatmap.png", OVERWRITE)
+plt.show()
+
+# %%
+# Best deep-feature method: full evaluation figure
+best_deep = data["DEEP"].sort_values("auroc", ascending=False)["method"].iloc[0]
+fig = plot_evaluation(*deep_results[best_deep], eval_labels, f"Best deep-feature method: {best_deep}")
+save_figure(fig, RESULTS_DIR / "deep_features_best.png", OVERWRITE)
+plt.show()
+
+# %%
+# Handcrafted vs deep features: the best method of every family (highest mean AUROC)
+families = [("handcrafted one-class", data["ONE_CLASS"]), ("handcrafted supervised", data["SUPERVISED"])] + [
+    (family, table) for family, table in data["DEEP"].groupby("family")
+]
+pd.concat([
+    table.sort_values("auroc", ascending=False).head(1).assign(family=family) for family, table in families
+]).set_index("family")[["method", "auroc", "balanced_accuracy", "har", "false_alarms_pct"] + eval_labels[1:]].round(2)
+
+# %% [markdown]
 # # Experiments
 
 # %% [markdown]
@@ -2715,20 +2832,31 @@ pyod_detectors = {
     # patterns have ~0 variance and PCA's score (divided by that variance) would explode
     "PCA": lambda: PyodPCA(n_components=0.99, svd_solver="full", random_state=SEED),
 }
-pyod_image_scores = load_or_compute(
-    CACHE_DIR / "pyod_scores.pkl",
-    lambda: run_one_class_detectors(pyod_detectors, data["WHOLE_FEATURES"], data["TILE_FEATURES"], eval_info),
-    USE_SAVED_RESULTS,
-)
-pyod_summary = pd.DataFrame([
-    summary_row(f"PyOD {name} | {input_name}", *evaluate_method(scores, eval_info, two_sided=False), eval_labels)
-    for (name, input_name), scores in pyod_image_scores.items()
-])
-print("PyOD detectors next to the final scikit-learn one-class models, sorted by AUROC:")
-pd.concat([data["ONE_CLASS"], pyod_summary]).sort_values("auroc", ascending=False)[
+# PyOD on the 95 handcrafted features and on the deep features of every backbone in DEEP_BACKBONES
+pyod_inputs = {"handcrafted": (data["WHOLE_FEATURES"], data["TILE_FEATURES"])}
+pyod_inputs.update({backbone: deep_feature_tables(features) for backbone, features in deep_features.items()})
+pyod_rows = []
+for feature_set, (whole_table, tile_table) in pyod_inputs.items():
+    # saved after the first run (the handcrafted file keeps its earlier name)
+    cache_file = CACHE_DIR / ("pyod_scores.pkl" if feature_set == "handcrafted" else f"pyod_{feature_set}.pkl")
+    # progress bar: one step = one detector trained on one input in one run (5 x 2 x 4 = 40 steps)
+    scores = load_or_compute(
+        cache_file,
+        lambda: run_one_class_detectors(pyod_detectors, whole_table, tile_table, eval_info, desc=f"PyOD {feature_set}"),
+        USE_SAVED_RESULTS,
+    )
+    for (name, input_name), image_scores in scores.items():
+        method = f"PyOD {feature_set} {name} | {input_name}"
+        pyod_rows.append(summary_row(method, *evaluate_method(image_scores, eval_info, two_sided=False), eval_labels))
+pyod_summary = pd.DataFrame(pyod_rows)
+
+print("PyOD detectors next to the final one-class models (handcrafted and deep features), top 20 by AUROC:")
+final_one_class = pd.concat([data["ONE_CLASS"], data["DEEP"][data["DEEP"]["family"] == "deep one-class"]])
+pd.concat([final_one_class, pyod_summary]).sort_values("auroc", ascending=False)[
     ["method", "auroc", "auroc_sd", "balanced_accuracy", "har", "false_alarms_pct", "false_alarms_sd_pct"]
-].round(3)
+].head(20).round(3)
 
 # %%
-fig = plot_detection_heatmap(pyod_summary, eval_labels, "Experiment: PyOD one-class detectors on all 95 features")
+fig = plot_detection_heatmap(pyod_summary, eval_labels,
+                             "Experiment: PyOD one-class detectors on handcrafted and deep features")
 plt.show()
