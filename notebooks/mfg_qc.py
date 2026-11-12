@@ -40,6 +40,8 @@ import numpy as np
 import pandas as pd
 import timm
 import torch
+from anomalib.models.components.sampling import KCenterGreedy
+from anomalib.models.image.patchcore.torch_model import PatchcoreModel
 from lightgbm import LGBMClassifier
 from matplotlib.patches import Rectangle
 from skimage.feature import local_binary_pattern
@@ -249,6 +251,14 @@ DEEP_BACKBONES = {  # short name -> timm model name
 }
 DEEP_FEATURES_DIR = Path("/home/qq/mfg_qc/data/features/deep")  # saved chunks per backbone (git-ignored)
 DEEP_BATCH_IMAGES = 4  # images per GPU batch (each = 12 tiles + 1 whole picture)
+
+# Anomaly detection (CLAUDE.md §9 Step 4): models that learn only from good tiles.
+# PatchCore (anomalib) on the 12 native 384-px tiles; about 45 min for all 4 runs on the GTX 1650
+PATCHCORE_BACKBONE = "resnet18.a1_in1k"  # fastest choice; the paper's wide_resnet50_2 would take ~2.3 h
+PATCHCORE_LAYERS = ["layer2", "layer3"]  # mid-level feature maps: 48 x 48 patches per tile, 128 + 256 numbers each
+PATCHCORE_KEEP_SHARE = 0.025  # random share of the patches of every good training image kept (~220,000 per run)
+PATCHCORE_BANK_SIZE = 10_000  # memory bank: patches that anomalib's coreset selection picks from the kept ones
+PATCHCORE_NEIGHBORS = 9       # anomalib default: the tile score is reweighted using 9 nearest bank patches
 
 data = {}
 
@@ -1150,7 +1160,9 @@ def evaluate_method(
 
     Args:
         scores (pd.DataFrame): index = file, one column per run (1-4): the method's score of every
-            image in that run (for scores that need no training, the same column 4 times).
+            image in that run (for scores that need no training, the same column 4 times). Only the
+            images the run uses need a score: test fold, test-only images and good validation images
+            (PatchCore scores only these; the other images may be NaN).
         info (pd.DataFrame): index = file (images that are not excluded), columns fold, label, is_defect.
         two_sided (bool): True for single features (a defect can move them either way).
 
@@ -1170,8 +1182,10 @@ def evaluate_method(
     for run in scores.columns:
         roles = run_roles(info["fold"], run)
         s = scores[run].reindex(info.index)
-        if s.isna().any():  # e.g. saved results from before images were added
-            raise ValueError(f"No score for {s.isna().sum()} images (e.g. {s.index[s.isna()][0]}); "
+        needed = roles.isin(["test", "test_only"]) | ((roles == "validation") & (info["label"] == "good"))
+        missing = s.index[needed & s.isna()]
+        if len(missing):  # e.g. saved results from before images were added
+            raise ValueError(f"No score for {len(missing)} images (e.g. {missing[0]}); "
                              "the saved results are out of date: set USE_SAVED_RESULTS = False")
         good_val = s[(roles == "validation") & (info["label"] == "good")]
         u = pd.Series(unusualness(s, good_val, two_sided), index=info.index)
@@ -1805,6 +1819,197 @@ def deep_feature_tables(features: dict) -> tuple[pd.DataFrame, pd.DataFrame]:
     tiles.insert(0, "file", np.repeat(features["files"], n_tiles))
     tiles.insert(1, "tile_idx", np.tile(np.arange(n_tiles), n))
     return whole, tiles
+
+
+def make_patchcore() -> PatchcoreModel:
+    """Create anomalib's PatchCore model with a pretrained backbone and an empty memory bank, on DEVICE.
+
+    Returns:
+        PatchcoreModel: backbone PATCHCORE_BACKBONE (e.g. "resnet18.a1_in1k", weights downloaded once into
+            data/weights), patch features from PATCHCORE_LAYERS, tile score reweighted with
+            PATCHCORE_NEIGHBORS bank neighbours.
+    """
+    return PatchcoreModel(layers=PATCHCORE_LAYERS, backbone=PATCHCORE_BACKBONE, pre_trained=True,
+                          num_neighbors=PATCHCORE_NEIGHBORS).to(DEVICE)
+
+
+def patchcore_input(tiles: torch.Tensor, model: PatchcoreModel) -> torch.Tensor:
+    """Turn uint8 tiles into the normalised float input of the PatchCore backbone (no resizing).
+
+    Args:
+        tiles (torch.Tensor): uint8 RGB tiles of shape (n_images, 12, 384, 384, 3), e.g. from ModelInputs.
+        model (PatchcoreModel): from make_patchcore (its backbone's ImageNet mean and SD are used).
+
+    Returns:
+        torch.Tensor: float32 on DEVICE, shape (n_images * 12, 3, 384, 384).
+    """
+    config = model.feature_extractor.feature_extractor.pretrained_cfg
+    mean = torch.tensor(config["mean"], device=DEVICE).view(1, 3, 1, 1)
+    std = torch.tensor(config["std"], device=DEVICE).view(1, 3, 1, 1)
+    x = tiles.to(DEVICE).flatten(0, 1).permute(0, 3, 1, 2).float() / 255
+    return (x - mean) / std
+
+
+def patchcore_memory_bank(model: PatchcoreModel, paths: list[Path], seed: int, desc: str) -> torch.Tensor:
+    """Build the PatchCore memory bank, a catalogue of good patches, from good training images.
+
+    1. The backbone describes every tile with a 48 x 48 grid of patches (384 numbers each for ResNet-18;
+       anomalib averages every patch with its 3 x 3 neighbours).
+    2. A random PATCHCORE_KEEP_SHARE of the 12 x 2304 = 27,648 patches of every image is kept
+       (all patches of ~320 images would need ~13 GB).
+    3. anomalib's coreset selection (k-center greedy) picks PATCHCORE_BANK_SIZE of the kept patches so
+       that every kept patch has a close one among them.
+
+    Args:
+        model (PatchcoreModel): from make_patchcore.
+        paths (list[Path]): good training images, e.g. the ~320 good images of the two training folds.
+        seed (int): random seed of the patch sampling and the coreset start, e.g. SEED + run.
+        desc (str): label of the progress bar, e.g. "run 1: memory bank from 312 good images".
+
+    Returns:
+        torch.Tensor: float32 on DEVICE, shape (PATCHCORE_BANK_SIZE, 384).
+    """
+    torch.manual_seed(seed)
+    model.train()  # anomalib: in training mode the model returns the patch features (backbone stays in eval)
+    loader = DataLoader(ModelInputs(paths, ROI, CROP_SIZE, WHOLE_SIZE), batch_size=DEEP_BATCH_IMAGES,
+                        num_workers=DATA_WORKERS)
+    progress = tqdm(total=len(paths), desc=desc, unit="image")
+    kept = []
+    with torch.no_grad():
+        for tiles, _ in loader:
+            features = model(patchcore_input(tiles, model))  # (n_images * 12 * 2304, 384)
+            model.embedding_store.clear()  # anomalib would keep all features; only a random sample is kept
+            n_keep = round(PATCHCORE_KEEP_SHARE * len(features))
+            kept.append(features[torch.randperm(len(features), device=features.device)[:n_keep]])
+            progress.update(tiles.shape[0])
+    progress.close()
+    kept = torch.cat(kept)
+    sampler = KCenterGreedy(embedding=kept, sampling_ratio=(PATCHCORE_BANK_SIZE + 0.5) / len(kept))
+    return sampler.sample_coreset()  # shows its own progress bar ("Selecting Coreset Indices")
+
+
+def patchcore_tile_scores(model: PatchcoreModel, paths: list[Path], desc: str) -> np.ndarray:
+    """Score every tile with PatchCore: how far its most unusual patch is from all good patches.
+
+    Every patch of a tile looks for its nearest patch in the memory bank (Euclidean distance). The tile
+    score is the largest of these distances, slightly reweighted by anomalib (by how isolated the
+    nearest bank patch is among its PATCHCORE_NEIGHBORS neighbours). Higher = more unusual.
+
+    Args:
+        model (PatchcoreModel): with its memory bank set (model.memory_bank).
+        paths (list[Path]): images to score, e.g. the ~2,100 images of one run.
+        desc (str): label of the progress bar, e.g. "run 1: scoring".
+
+    Returns:
+        np.ndarray: float32, shape (n_images, 12): one score per tile, in tile_idx order.
+    """
+    model.eval()
+    loader = DataLoader(ModelInputs(paths, ROI, CROP_SIZE, WHOLE_SIZE), batch_size=DEEP_BATCH_IMAGES,
+                        num_workers=DATA_WORKERS)
+    progress = tqdm(total=len(paths), desc=desc, unit="image")
+    scores = []
+    with torch.no_grad():
+        for tiles, _ in loader:
+            out = model(patchcore_input(tiles, model))
+            scores.append(out.pred_score.reshape(tiles.shape[0], -1).cpu().numpy())
+            progress.update(tiles.shape[0])
+    progress.close()
+    return np.concatenate(scores)
+
+
+def run_patchcore(info: pd.DataFrame, paths: pd.Series, run: int) -> dict:
+    """Train PatchCore on the good training images of one run and score the images that run needs.
+
+    Scored: the test fold, the test-only images (F, U, M) and the good validation images (for the cut).
+    Not scored: the training images (their patches are in the memory bank) and the defective
+    validation images (the evaluation does not use them).
+
+    Args:
+        info (pd.DataFrame): index = file, columns fold and label (images that are not excluded),
+            e.g. eval_info.
+        paths (pd.Series): index = file, the path of every image.
+        run (int): evaluation run, 1-4 (= the test fold).
+
+    Returns:
+        dict: "bank" (np.ndarray float32 of shape (PATCHCORE_BANK_SIZE, 384): the memory bank) and
+            "tile_scores" (pd.DataFrame: index = file of the scored images, columns 0-11 = tile_idx).
+    """
+    roles = run_roles(info["fold"], run)
+    good = info["label"] == "good"
+    train = info.index[(roles == "train") & good]
+    scored = info.index[roles.isin(["test", "test_only"]) | ((roles == "validation") & good)]
+    model = make_patchcore()
+    model.memory_bank = patchcore_memory_bank(model, [Path(paths[f]) for f in train], SEED + run,
+                                              f"run {run}: memory bank from {len(train)} good images")
+    tile_scores = patchcore_tile_scores(model, [Path(paths[f]) for f in scored], f"run {run}: scoring")
+    bank = model.memory_bank.cpu().numpy()
+    del model
+    torch.cuda.empty_cache()
+    return {"bank": bank, "tile_scores": pd.DataFrame(tile_scores, index=scored)}
+
+
+def patchcore_map(model: PatchcoreModel, path: Path) -> tuple[np.ndarray, np.ndarray]:
+    """Return the anomaly map of one image: the patch distances of its 12 tiles, put back into the ROI.
+
+    Args:
+        model (PatchcoreModel): with its memory bank set (model.memory_bank).
+        path (Path): image file, e.g. Path(".../A/A01/A01_0125.png").
+
+    Returns:
+        tuple[np.ndarray, np.ndarray]: the ROI (uint8, shape (1152, 1536, 3)) and its anomaly map (float32,
+            shape (1152, 1536): distance of every patch to its nearest good patch, enlarged to pixels
+            and smoothed by anomalib).
+    """
+    roi_img = load_roi(path, ROI)
+    tiles = torch.from_numpy(cut_tiles(roi_img, CROP_SIZE)).unsqueeze(0)  # (1, 12, 384, 384, 3)
+    model.eval()
+    with torch.no_grad():
+        maps = model(patchcore_input(tiles, model)).anomaly_map.squeeze(1).cpu().numpy()  # (12, 384, 384)
+    rows, cols = roi_img.shape[0] // CROP_SIZE, roi_img.shape[1] // CROP_SIZE
+    # inverse of cut_tiles: (rows * cols, t, t) -> (rows, cols, t, t) -> (rows, t, cols, t) -> (rows * t, cols * t)
+    full = maps.reshape(rows, cols, CROP_SIZE, CROP_SIZE).transpose(0, 2, 1, 3)
+    return roi_img, full.reshape(rows * CROP_SIZE, cols * CROP_SIZE)
+
+
+def plot_anomaly_maps(examples: list[dict], vmin: float, vmax: float, title: str) -> plt.Figure:
+    """Draw example images next to their anomaly maps, two examples per row.
+
+    Args:
+        examples (list[dict]): one dict per example with label, file, run, roi (ROI image),
+            map (anomaly map divided by the run's cut), tile_flagged (12 bools: tile above the cut)
+            and flagged (bool: the image's decision).
+        vmin (float): bottom of the colour scale in units of the cut, e.g. 0.5 (typical good patches).
+        vmax (float): top of the colour scale in units of the cut, e.g. 1.5.
+        title (str): figure title.
+
+    Returns:
+        plt.Figure: per example, left the image (thin white lines = the 12 tiles; blue frame = a tile
+            above the cut, i.e. a tile that makes the image flagged) and right its anomaly map
+            (white = like the good patches, dark blue = far from all of them; 1 = the run's cut).
+    """
+    n_rows = (len(examples) + 1) // 2
+    fig, axes = plt.subplots(n_rows, 4, figsize=(20, 3.9 * n_rows), constrained_layout=True)
+    for ax in axes.flat:
+        ax.axis("off")
+    for k, ex in enumerate(examples):
+        ax_img, ax_map = axes.flat[2 * k], axes.flat[2 * k + 1]
+        ax_img.imshow(ex["roi"])
+        rows, cols = ex["roi"].shape[0] // CROP_SIZE, ex["roi"].shape[1] // CROP_SIZE
+        for c in range(1, cols):
+            ax_img.axvline(c * CROP_SIZE, color="white", lw=0.6, alpha=0.7)
+        for r in range(1, rows):
+            ax_img.axhline(r * CROP_SIZE, color="white", lw=0.6, alpha=0.7)
+        for t in np.flatnonzero(ex["tile_flagged"]):
+            r, c = divmod(t, cols)
+            ax_img.add_patch(Rectangle((c * CROP_SIZE + 6, r * CROP_SIZE + 6), CROP_SIZE - 12, CROP_SIZE - 12,
+                                       fill=False, ec=SERIES_COLOUR, lw=2.5))
+        decision = "flagged" if ex["flagged"] else "passed"
+        ax_img.set_title(f"{ex['label']}: {ex['file']} (run {ex['run']}), {decision}", fontsize=10)
+        image = ax_map.imshow(ex["map"], cmap="Blues", vmin=vmin, vmax=vmax)
+        ax_map.set_title(f"anomaly map, {int(np.sum(ex['tile_flagged']))} of 12 tiles above the cut", fontsize=10)
+    fig.colorbar(image, ax=axes, shrink=0.5, label="patch distance / cut of the run (1 = cut)")
+    fig.suptitle(title, fontsize=13)
+    return fig
 
 
 # %% [markdown]
@@ -2885,6 +3090,112 @@ plt.show()
 families = [("handcrafted one-class", data["ONE_CLASS"]), ("handcrafted supervised", data["SUPERVISED"])] + [
     (family, table) for family, table in data["DEEP"].groupby("family")
 ]
+pd.concat([
+    table.sort_values("auroc", ascending=False).head(1).assign(family=family) for family, table in families
+]).set_index("family")[["method", "auroc", "balanced_accuracy", "har", "false_alarms_pct"] + eval_labels[1:]].round(2)
+
+# %% [markdown]
+# # Anomaly detection
+#
+# Models that learn only what good images look like (CLAUDE.md §9 Step 4) and flag everything that
+# differs, also changes they have never seen (e.g. frozen milk). They compare small patches, so they
+# also show *where* an image is unusual (anomaly map).
+
+# %% [markdown]
+# ## PatchCore
+#
+# anomalib's PatchCore on the 12 native 384-px tiles of every image (no shrinking):
+# 1. a pretrained ResNet-18 describes every tile with a 48 x 48 grid of patches, each with 384 numbers
+#    (its layer2 and layer3 feature maps; anomalib averages every patch with its 3 x 3 neighbours);
+# 2. **training** (good images of the two training folds only, ~320 per run): a random 2.5 % of the
+#    patches of every image is kept (~220,000), and anomalib's coreset selection picks the 10,000 that
+#    cover the rest best: the **memory bank**, a catalogue of what good patches look like;
+# 3. **scoring**: every patch of a tile looks for its nearest patch in the memory bank; the tile score is
+#    the distance of its most unusual patch (slightly reweighted by anomalib); the image score is the
+#    highest of its 12 tile scores ("tiles max") or their mean ("tiles mean");
+# 4. the same evaluation as every other method: cut at the 95th percentile of the good validation images.
+#
+# Example: in a bubble image the patches on the bubble edge have no close good patch, so that tile gets
+# a high score, the image is flagged and its anomaly map is dark on the bubble.
+#
+# Only the images a run uses are scored (test fold, test-only images, good validation images), not the
+# training images, whose patches are in the memory bank. About 45 min for all 4 runs on the GTX 1650.
+# Every run is saved when it is done (memory bank + tile scores, ~16 MB), so after an interruption the
+# finished runs are loaded and the next one starts.
+
+# %%
+# PatchCore in all 4 runs: memory bank from the good training images, then scores of 12 tiles per image
+image_paths = data["TILES"].drop_duplicates("file").set_index("file")["path"]
+patchcore_name = PATCHCORE_BACKBONE.split(".")[0]  # "resnet18"
+patchcore_runs = {
+    run: load_or_compute(CACHE_DIR / f"patchcore_{patchcore_name}_run{run}_{data['KEY']}.pkl",
+                         lambda: run_patchcore(eval_info, image_paths, run), USE_SAVED_RESULTS)
+    for run in FOLDS
+}
+pd.DataFrame({run: {"memory bank": r["bank"].shape, "images scored": len(r["tile_scores"])}
+              for run, r in patchcore_runs.items()})
+
+# %%
+# Image score = highest tile score ("tiles max") or mean of the 12 ("tiles mean"); then the common evaluation
+patchcore_results = {}  # method name -> (metrics per run, predictions)
+for agg in ("max", "mean"):
+    image_scores = pd.DataFrame({run: r["tile_scores"].agg(agg, axis=1) for run, r in patchcore_runs.items()})
+    patchcore_results[f"PatchCore {patchcore_name} | tiles {agg}"] = evaluate_method(image_scores, eval_info,
+                                                                                    two_sided=False)
+data["ANOMALY"] = pd.DataFrame([
+    {"family": "anomaly detection", **summary_row(method, *result, eval_labels)}
+    for method, result in patchcore_results.items()
+])
+save_table(data["ANOMALY"].round(4), RESULTS_DIR / "anomaly_summary.csv", OVERWRITE)
+data["ANOMALY"].set_index("method")[
+    ["auroc", "auroc_sd", "balanced_accuracy", "har", "false_alarms_pct", "false_alarms_sd_pct"] + eval_labels[1:]
+].round(2)
+
+# %%
+# Best PatchCore variant: full evaluation figure
+best_anomaly = data["ANOMALY"].sort_values("auroc", ascending=False)["method"].iloc[0]
+fig = plot_evaluation(*patchcore_results[best_anomaly], eval_labels, f"Best anomaly detection: {best_anomaly}")
+save_figure(fig, RESULTS_DIR / "anomaly_best.png", OVERWRITE)
+plt.show()
+
+# %%
+# Anomaly maps: one random image per label, scored by the run in which it is a test image (F, U, M: run 1).
+# Colour = patch distance divided by the run's cut (the 95th percentile of the good validation images'
+# highest tile score); blue frame = tile above the cut (with "tiles max", one such tile flags the image)
+max_predictions = patchcore_results[f"PatchCore {patchcore_name} | tiles max"][1].set_index(["run", "file"])
+rng = np.random.default_rng(SEED)
+model = make_patchcore()
+examples = []
+for label in eval_labels:
+    files = sorted(eval_info.index[eval_info["label"] == label])
+    file = files[rng.integers(len(files))]
+    fold = eval_info.loc[file, "fold"]
+    run = 1 if pd.isna(fold) else int(fold)
+    tile_scores = patchcore_runs[run]["tile_scores"]
+    roles = run_roles(eval_info["fold"], run)
+    good_val_max = tile_scores.max(axis=1).reindex(eval_info.index[(roles == "validation")
+                                                                   & (eval_info["label"] == "good")])
+    model.memory_bank = torch.from_numpy(patchcore_runs[run]["bank"]).to(DEVICE)
+    roi_img, anomaly_map = patchcore_map(model, Path(image_paths[file]))
+    examples.append({
+        "label": label, "file": file, "run": run, "roi": roi_img,
+        "map": anomaly_map / np.percentile(good_val_max, FLAG_PERCENTILE),
+        # the same rule as for the image: a tile is above the cut if its score alone would flag the image
+        "tile_flagged": unusualness(tile_scores.loc[file], good_val_max, two_sided=False) > FLAG_PERCENTILE,
+        "flagged": bool(max_predictions.loc[(run, file), "flagged"]),
+    })
+del model
+torch.cuda.empty_cache()
+fig = plot_anomaly_maps(examples, vmin=0.5, vmax=1.5,
+                        title=f"PatchCore ({patchcore_name}, tiles max): one random image per label")
+save_figure(fig, RESULTS_DIR / "anomaly_maps_patchcore.png", OVERWRITE)
+plt.show()
+
+# %%
+# All families: the best method of each (highest mean AUROC)
+families = [("handcrafted one-class", data["ONE_CLASS"]), ("handcrafted supervised", data["SUPERVISED"])] + [
+    (family, table) for family, table in data["DEEP"].groupby("family")
+] + [("anomaly detection", data["ANOMALY"])]
 pd.concat([
     table.sort_values("auroc", ascending=False).head(1).assign(family=family) for family, table in families
 ]).set_index("family")[["method", "auroc", "balanced_accuracy", "har", "false_alarms_pct"] + eval_labels[1:]].round(2)
