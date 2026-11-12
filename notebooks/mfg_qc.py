@@ -47,6 +47,8 @@ from anomalib.models.image.padim.torch_model import PadimModel
 from anomalib.models.image.patchcore.torch_model import PatchcoreModel
 from lightgbm import LGBMClassifier
 from matplotlib.patches import Rectangle
+from pytorch_grad_cam import GradCAM
+from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
 from skimage.feature import local_binary_pattern
 from skimage.filters import threshold_otsu
 from sklearn.covariance import LedoitWolf
@@ -288,6 +290,19 @@ VOTERS = [  # voting: the best method of each family, each decides on its own (u
     "DFM resnet18 | tiles mean",                  # anomaly detection
 ]
 VOTES_NEEDED = [1, 2, 3, 4, 5]  # flag an image if at least this many voters flag it (3 = majority)
+
+# CNNs (CLAUDE.md §9 Step 5): ImageNet networks fine-tuned with two outputs, good vs defective (T1) and
+# which label (T2). Design A: the whole picture (WHOLE_SIZE). Trained in fp32: fp16 overflows in these
+# networks (NaN) and was 4x slower on the GTX 1650 (speed test: 22.5 training images/s, 1.75 GB GPU).
+CNN_BACKBONES = {"resnet18": "resnet18.a1_in1k"}  # short name -> timm name (same weights as above)
+CNN_EPOCHS = 20      # at most this many passes over the training images (the learning rate is planned for 20)
+CNN_PATIENCE = 5     # early stopping: stop when the validation loss has not improved for 5 epochs;
+                     # the epoch with the lowest validation loss is kept
+CNN_BATCH = 8        # images per GPU batch
+CNN_ACCUMULATE = 8   # batches per weight update: effective batch of 64 images
+CNN_LR = 3e-4        # AdamW learning rate: rises during the first epoch, then falls to 0 (cosine)
+CNN_WEIGHT_DECAY = 0.01
+CNN_DIR = Path("/home/qq/mfg_qc/data/cnn")  # checkpoints (git-ignored); training resumes after every epoch
 
 data = {}
 
@@ -2204,6 +2219,348 @@ def run_unusualness(scores: pd.DataFrame, info: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(out)
 
 
+class WholePictures(Dataset):
+    """Whole pictures (the ROI shrunk to WHOLE_SIZE) with their targets, for training or scoring a CNN.
+
+    Args:
+        paths (list[Path]): image files, e.g. the ~1,700 training images of one run.
+        targets (np.ndarray): int array of shape (n, 2): [is_defect (0/1), label index in the classes
+            (-1 = not a training label, e.g. frozen)], e.g. [[0, 0], [1, 2], ...].
+        augment_images (bool): True (training) = every time a picture is read, one of the 4 versions in
+            AUG_WHOLE is picked at random (original, h-flip, v-flip, 180 deg); False = always the original.
+
+    Returns (per item):
+        tuple[torch.Tensor, torch.Tensor]: the picture, uint8 RGB of shape (576, 768, 3), and its targets (2,).
+    """
+
+    def __init__(self, paths: list[Path], targets: np.ndarray, augment_images: bool):
+        self.paths, self.targets, self.augment_images = paths, targets, augment_images
+
+    def __len__(self) -> int:
+        return len(self.paths)
+
+    def __getitem__(self, i: int) -> tuple[torch.Tensor, torch.Tensor]:
+        picture = shrink_roi(load_roi(self.paths[i], ROI), WHOLE_SIZE)
+        if self.augment_images:  # torch's random numbers: seeded per worker by the DataLoader's generator
+            k_rot, flip = AUG_WHOLE[int(torch.randint(len(AUG_WHOLE), (1,)))]
+            picture = augment(picture, k_rot, flip)
+        return torch.from_numpy(picture), torch.from_numpy(self.targets[i])
+
+
+class TwoHeadCNN(torch.nn.Module):
+    """A pretrained timm CNN with two outputs: good vs defective (T1) and which label (T2).
+
+    The network's pooled features (512 numbers for ResNet-18) feed two linear layers: one number for
+    "defective?" and one number per label.
+
+    Args:
+        timm_name (str): e.g. "resnet18.a1_in1k" (weights downloaded once into data/weights).
+        n_classes (int): number of labels of the second output, e.g. 11 (good + 10 defect types).
+
+    Returns (forward):
+        torch.Tensor: logits of shape (n, 1 + n_classes): column 0 = defective (sigmoid -> P(defective)),
+            columns 1.. = the labels (softmax -> P(label)).
+    """
+
+    def __init__(self, timm_name: str, n_classes: int):
+        super().__init__()
+        self.backbone = timm.create_model(timm_name, pretrained=True, num_classes=0)  # -> pooled features
+        self.defect_head = torch.nn.Linear(self.backbone.num_features, 1)
+        self.label_head = torch.nn.Linear(self.backbone.num_features, n_classes)
+        config = self.backbone.pretrained_cfg
+        self.register_buffer("mean", torch.tensor(config["mean"]).view(1, 3, 1, 1))
+        self.register_buffer("std", torch.tensor(config["std"]).view(1, 3, 1, 1))
+
+    def prepare(self, pictures: torch.Tensor) -> torch.Tensor:
+        """Turn uint8 RGB pictures (n, h, w, 3) on the model's device into the normalised input (n, 3, h, w)."""
+        return (pictures.permute(0, 3, 1, 2).float() / 255 - self.mean) / self.std
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        features = self.backbone(x)
+        return torch.cat([self.defect_head(features), self.label_head(features)], dim=1)
+
+
+def cnn_loader(paths: list[Path], targets: np.ndarray, train: bool, seed: int = SEED) -> DataLoader:
+    """Return a DataLoader of whole pictures for a CNN, read in DATA_WORKERS processes.
+
+    Args:
+        paths (list[Path]): image files. targets (np.ndarray): (n, 2), as in WholePictures.
+        train (bool): True = shuffled and randomly augmented; False = in order, not augmented.
+        seed (int): seed of the order and the augmentation, e.g. different for every epoch, so that
+            an epoch repeated after an interruption is the same.
+
+    Returns:
+        DataLoader: batches of CNN_BATCH pictures (n, 576, 768, 3) uint8 and their targets (n, 2).
+    """
+    return DataLoader(WholePictures(paths, targets, augment_images=train), batch_size=CNN_BATCH, shuffle=train,
+                      num_workers=DATA_WORKERS, generator=torch.Generator().manual_seed(seed))
+
+
+def cnn_loss(logits: torch.Tensor, targets: torch.Tensor, pos_weight: torch.Tensor,
+             class_weights: torch.Tensor) -> torch.Tensor:
+    """Return the CNN's loss: good-vs-defective loss + label loss, each balanced with class weights.
+
+    Args:
+        logits (torch.Tensor): from TwoHeadCNN, shape (n, 1 + n_classes).
+        targets (torch.Tensor): shape (n, 2): is_defect, label index.
+        pos_weight (torch.Tensor): weight of a defective picture in the first loss, e.g. 0.206 in run 1
+            (= 296 good / 1,438 defective training pictures, so both groups count the same).
+        class_weights (torch.Tensor): weight of every label in the second loss, shape (n_classes,),
+            e.g. 0.53 for good (296 pictures in run 1) and about 1.0 for a defect type (~160 pictures).
+
+    Returns:
+        torch.Tensor: the loss (a single number), e.g. 2.9 at the start (0.69 + 2.2 for 11 labels).
+    """
+    defect_loss = torch.nn.functional.binary_cross_entropy_with_logits(logits[:, 0], targets[:, 0].float(),
+                                                                       pos_weight=pos_weight)
+    label_loss = torch.nn.functional.cross_entropy(logits[:, 1:], targets[:, 1], weight=class_weights)
+    return defect_loss + label_loss
+
+
+def cnn_epoch(model: TwoHeadCNN, loader: DataLoader, pos_weight: torch.Tensor, class_weights: torch.Tensor,
+              progress: tqdm, optimizer: torch.optim.Optimizer | None = None,
+              scheduler: torch.optim.lr_scheduler.LRScheduler | None = None) -> float:
+    """Run one pass over the pictures: training (with an optimizer) or validation (without); return the mean loss.
+
+    Training: the weights are updated after every CNN_ACCUMULATE batches (64 pictures), and the learning
+    rate then takes one step of the scheduler. Validation: no gradients, BatchNorm uses its saved statistics.
+
+    Args:
+        model (TwoHeadCNN): the network on DEVICE.
+        loader (DataLoader): from cnn_loader.
+        pos_weight, class_weights (torch.Tensor): as in cnn_loss.
+        progress (tqdm): progress bar, advanced by the number of pictures.
+        optimizer (torch.optim.Optimizer | None): None = validation.
+        scheduler (torch.optim.lr_scheduler.LRScheduler | None): learning-rate schedule (training only).
+
+    Returns:
+        float: mean loss per picture, e.g. 0.35.
+
+    Raises:
+        ValueError: if a loss is NaN or infinite.
+    """
+    training = optimizer is not None
+    model.train(training)
+    total, count = 0.0, 0
+    with torch.set_grad_enabled(training):
+        for i, (pictures, targets) in enumerate(loader):
+            loss = cnn_loss(model(model.prepare(pictures.to(DEVICE))), targets.to(DEVICE), pos_weight, class_weights)
+            if not torch.isfinite(loss):
+                raise ValueError("Non-finite loss (NaN or inf)")
+            if training:
+                (loss / CNN_ACCUMULATE).backward()
+                if (i + 1) % CNN_ACCUMULATE == 0 or i + 1 == len(loader):
+                    optimizer.step()
+                    optimizer.zero_grad(set_to_none=True)
+                    scheduler.step()
+            total += loss.item() * len(pictures)
+            count += len(pictures)
+            progress.update(len(pictures))
+    return total / count
+
+
+def cnn_predict(model: TwoHeadCNN, paths: list[Path], desc: str) -> np.ndarray:
+    """Return P(defective) and P(label) of every picture (no augmentation, no gradients).
+
+    Args:
+        model (TwoHeadCNN): the trained network on DEVICE.
+        paths (list[Path]): image files, e.g. the test, validation and test-only images of one run.
+        desc (str): label of the progress bar, e.g. "run 1: scoring".
+
+    Returns:
+        np.ndarray: float array of shape (n, 1 + n_classes): column 0 = P(defective), then P(label)
+            for every label (these sum to 1), e.g. [0.98, 0.01, 0.95, ...].
+    """
+    loader = cnn_loader(paths, np.zeros((len(paths), 2), dtype=np.int64), train=False)
+    model.eval()
+    parts = []
+    with torch.inference_mode(), tqdm(total=len(paths), desc=desc, unit="image") as progress:
+        for pictures, _ in loader:
+            logits = model(model.prepare(pictures.to(DEVICE)))
+            parts.append(torch.cat([torch.sigmoid(logits[:, :1]), torch.softmax(logits[:, 1:], dim=1)], dim=1).cpu())
+            progress.update(len(pictures))
+    return torch.cat(parts).numpy()
+
+
+def train_cnn(timm_name: str, info: pd.DataFrame, paths: pd.Series, run: int, classes: list[str],
+              checkpoint_dir: Path, resume: bool) -> dict:
+    """Fine-tune a two-output CNN on the whole pictures of one run, then score the images the run uses.
+
+    Training pictures: all labels of the two training folds (good and defective); validation pictures:
+    the validation fold. After every epoch the validation loss is computed and two checkpoints are saved
+    in checkpoint_dir: last.pt (weights + optimizer, to resume) and best.pt (the weights of the epoch with
+    the lowest validation loss so far). Early stopping: training stops before epoch CNN_EPOCHS when the
+    best epoch is CNN_PATIENCE epochs back, e.g. best epoch 6 -> stop after epoch 11 (also when resuming).
+    At the end, best.pt scores the test, validation and test-only images. The random seed is fixed
+    (SEED + run); cuDNN on the GPU may still make two trainings differ slightly.
+
+    Args:
+        timm_name (str): e.g. "resnet18.a1_in1k".
+        info (pd.DataFrame): index = file (images that are not excluded), columns fold, label, is_defect.
+        paths (pd.Series): index = file, the image path, e.g. image_paths.
+        run (int): the run (= its test fold), 1-4.
+        classes (list[str]): the labels of the second output, e.g. good + the 10 defect types.
+        checkpoint_dir (Path): folder of last.pt and best.pt, e.g. CNN_DIR / "resnet18_whole_run1_<KEY>".
+        resume (bool): True = continue after the last finished epoch if last.pt exists (e.g.
+            USE_SAVED_RESULTS); False = train from the start and replace the checkpoints.
+
+    Returns:
+        dict: "history" (pd.DataFrame, one row per epoch: epoch, train_loss, val_loss, lr), "best_epoch"
+            (int, from 1), "scores" (pd.DataFrame, index = file of the test, validation and test-only
+            images; column "p_defect" = P(defective), and one column per label with P(label)).
+    """
+    roles = run_roles(info["fold"], run)
+    label_index = info["label"].map({c: i for i, c in enumerate(classes)}).fillna(-1).astype(int)
+    targets = np.stack([info["is_defect"].astype(int).to_numpy(), label_index.to_numpy()], axis=1)
+    all_paths = np.array([Path(p) for p in paths.reindex(info.index)], dtype=object)
+    train, val = (roles == "train").to_numpy(), (roles == "validation").to_numpy()
+
+    # Class weights from the training pictures: good and defective count the same, and so do all labels
+    y = targets[train]
+    pos_weight = torch.tensor((y[:, 0] == 0).sum() / (y[:, 0] == 1).sum(), dtype=torch.float32, device=DEVICE)
+    counts = np.bincount(y[:, 1], minlength=len(classes))
+    class_weights = torch.tensor(counts.sum() / (len(classes) * counts), dtype=torch.float32, device=DEVICE)
+
+    torch.manual_seed(SEED + run)
+    model = TwoHeadCNN(timm_name, len(classes)).to(DEVICE)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=CNN_LR, weight_decay=CNN_WEIGHT_DECAY)
+    updates_per_epoch = int(np.ceil(np.ceil(train.sum() / CNN_BATCH) / CNN_ACCUMULATE))
+    total_updates = CNN_EPOCHS * updates_per_epoch
+    scheduler = torch.optim.lr_scheduler.LambdaLR(  # rises during the first epoch, then cosine down to 0
+        optimizer,  # (a plain Python float, so that last.pt can be loaded safely)
+        lambda step: float(min(1.0, (step + 1) / updates_per_epoch) * 0.5 * (1 + np.cos(np.pi * step / total_updates))))
+
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    last_file, best_file = checkpoint_dir / "last.pt", checkpoint_dir / "best.pt"
+    history, best_loss, best_epoch = [], float("inf"), 0
+    if resume and last_file.exists():
+        state = torch.load(last_file, map_location=DEVICE)
+        model.load_state_dict(state["model"])
+        optimizer.load_state_dict(state["optimizer"])
+        scheduler.load_state_dict(state["scheduler"])
+        history, best_loss, best_epoch = state["history"], state["best_loss"], state["best_epoch"]
+        print(f"Resumed after epoch {len(history)} of {CNN_EPOCHS}: {last_file}")
+
+    per_epoch = int(train.sum() + val.sum())
+    progress = tqdm(total=CNN_EPOCHS * per_epoch, initial=len(history) * per_epoch,
+                    desc=f"{timm_name.split('.')[0]} run {run}", unit="image")
+    for epoch in range(len(history), CNN_EPOCHS):
+        if epoch - best_epoch >= CNN_PATIENCE:  # no lower validation loss for CNN_PATIENCE epochs: stop
+            break
+        done = f" | last val loss {history[-1]['val_loss']:.3f}, best {best_loss:.3f} (epoch {best_epoch})" if history else ""
+        progress.set_postfix_str(f"epoch {epoch + 1} of {CNN_EPOCHS}{done}")
+        train_loss = cnn_epoch(model, cnn_loader(list(all_paths[train]), targets[train], train=True,
+                                                 seed=SEED + 100 * run + epoch),
+                               pos_weight, class_weights, progress, optimizer, scheduler)
+        val_loss = cnn_epoch(model, cnn_loader(list(all_paths[val]), targets[val], train=False),
+                             pos_weight, class_weights, progress)
+        history.append({"epoch": epoch + 1, "train_loss": train_loss, "val_loss": val_loss,
+                        "lr": float(optimizer.param_groups[0]["lr"])})
+        if val_loss < best_loss:
+            best_loss, best_epoch = val_loss, epoch + 1
+            torch.save(model.state_dict(), best_file)
+        temporary = checkpoint_dir / "last.tmp"  # written first, so an interruption never leaves a broken last.pt
+        torch.save({"model": model.state_dict(), "optimizer": optimizer.state_dict(),
+                    "scheduler": scheduler.state_dict(), "history": history, "best_loss": best_loss,
+                    "best_epoch": best_epoch}, temporary)
+        temporary.replace(last_file)
+    if len(history) < CNN_EPOCHS:  # stopped early: the bar ends at 100 % and says why
+        progress.total = progress.n
+        progress.set_postfix_str(f"stopped after epoch {len(history)}: best val loss {best_loss:.3f} "
+                                 f"(epoch {best_epoch}), no lower one in the {CNN_PATIENCE} epochs after it")
+    progress.close()
+
+    model.load_state_dict(torch.load(best_file, map_location=DEVICE))
+    scored = (roles != "train").to_numpy()
+    probabilities = cnn_predict(model, list(all_paths[scored]), f"run {run}: scoring")
+    del model, optimizer
+    torch.cuda.empty_cache()
+    return {"history": pd.DataFrame(history), "best_epoch": best_epoch,
+            "scores": pd.DataFrame(probabilities, index=info.index[scored], columns=["p_defect"] + classes)}
+
+
+def cnn_gradcam(model: TwoHeadCNN, path: Path, output: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return a whole picture, its Grad-CAM map for one output of the CNN, and the CNN's probabilities.
+
+    Grad-CAM weighs every channel of the last feature map (layer4: 24 x 18 cells for 768 x 576 px) by how
+    much it raises the chosen output, keeps the positive part, enlarges it to the picture size and scales
+    it to 0-1 within the picture. Dark = the region that raises the output most.
+
+    Args:
+        model (TwoHeadCNN): the trained network on DEVICE (a ResNet: it has backbone.layer4).
+        path (Path): image file.
+        output (int): 0 = the "defective" output; 1 + i = the output of label classes[i].
+
+    Returns:
+        tuple[np.ndarray, np.ndarray, np.ndarray]: the picture (576, 768, 3) uint8, the map (576, 768)
+            float 0-1, and the probabilities (1 + n_classes,) as from cnn_predict.
+    """
+    picture = shrink_roi(load_roi(path, ROI), WHOLE_SIZE)
+    x = model.prepare(torch.from_numpy(picture).unsqueeze(0).to(DEVICE))
+    with GradCAM(model=model, target_layers=[model.backbone.layer4[-1]]) as cam:
+        heat = cam(input_tensor=x, targets=[ClassifierOutputTarget(output)])[0]
+    with torch.inference_mode():
+        logits = model(x)[0]
+    probabilities = torch.cat([torch.sigmoid(logits[:1]), torch.softmax(logits[1:], dim=0)]).cpu().numpy()
+    return picture, heat, probabilities
+
+
+def plot_training_curves(runs: dict[int, dict], title: str) -> plt.Figure:
+    """Draw the training and validation loss of every run per epoch, with the epoch that was kept.
+
+    Args:
+        runs (dict[int, dict]): run -> result of train_cnn ("history", "best_epoch").
+        title (str): figure title, e.g. "CNN resnet18, whole picture".
+
+    Returns:
+        plt.Figure: left, the loss on the (augmented) training pictures; right, on the validation fold,
+            with a dot at the kept epoch. Same log scale on both, so they can be compared.
+    """
+    fig, (ax_train, ax_val) = plt.subplots(1, 2, figsize=(14, 4.5), constrained_layout=True, sharey=True)
+    for run, result in runs.items():
+        h = result["history"]
+        ax_train.plot(h["epoch"], h["train_loss"], color=RUN_COLOURS[run], lw=2, label=f"run {run}")
+        ax_val.plot(h["epoch"], h["val_loss"], color=RUN_COLOURS[run], lw=2,
+                    label=f"run {run}: kept epoch {result['best_epoch']}")
+        best = h.loc[h["epoch"] == result["best_epoch"], "val_loss"].iloc[0]
+        ax_val.plot(result["best_epoch"], best, "o", color=RUN_COLOURS[run], ms=9, mec="white", mew=2)
+    ax_train.set(yscale="log", xlabel="epoch", ylabel="loss (defective + label)", title="training pictures (augmented)")
+    ax_val.set(xlabel="epoch", title="validation fold (dot = kept epoch: lowest loss)")
+    for ax in (ax_train, ax_val):
+        ax.legend(frameon=False)
+        ax.spines[["top", "right"]].set_visible(False)
+    fig.suptitle(title, fontsize=13)
+    return fig
+
+
+def plot_gradcam(examples: list[dict], title: str) -> plt.Figure:
+    """Draw whole pictures next to their Grad-CAM maps, two examples per row.
+
+    Args:
+        examples (list[dict]): one dict per picture with label, file, run, picture (576, 768, 3),
+            map (576, 768) 0-1, p_defect (float), predicted (str, most likely label), flagged (bool).
+        title (str): figure title.
+
+    Returns:
+        plt.Figure: per example the picture (title: label, file, run, decision) and its map (title:
+            P(defective) and the predicted label), with one shared colour bar.
+    """
+    n_rows = int(np.ceil(len(examples) / 2))
+    fig, axes = plt.subplots(n_rows, 4, figsize=(20, 3.4 * n_rows), constrained_layout=True)
+    for ax in axes.ravel():
+        ax.axis("off")
+    for i, ex in enumerate(examples):
+        ax_img, ax_map = axes[i // 2, 2 * (i % 2)], axes[i // 2, 2 * (i % 2) + 1]
+        ax_img.imshow(ex["picture"])
+        decision = "flagged" if ex["flagged"] else "passed"
+        ax_img.set_title(f"{ex['label']}: {ex['file']} (run {ex['run']}), {decision}", fontsize=10)
+        image = ax_map.imshow(ex["map"], cmap="Blues", vmin=0, vmax=1)
+        ax_map.set_title(f"P(defective) {ex['p_defect']:.2f}, predicted label: {ex['predicted']}", fontsize=10)
+    fig.colorbar(image, ax=axes, shrink=0.5, label="Grad-CAM of the \"defective\" output (0-1 within the picture)")
+    fig.suptitle(title, fontsize=13)
+    return fig
+
+
 # %% [markdown]
 # # Loading data
 
@@ -3545,6 +3902,147 @@ fig = plot_evaluation(*combined_results[f"vote: at least {majority} of {len(VOTE
                       f"Majority vote: at least {majority} of {len(VOTERS)} models")
 save_figure(fig, RESULTS_DIR / "combined_majority_vote.png", OVERWRITE)
 plt.show()
+
+# %% [markdown]
+# # CNNs
+#
+# Networks pretrained on ImageNet and **fine-tuned** on our pictures: all their weights are trained,
+# unlike the deep features above, where the network only looks. One network does both tasks: its pooled
+# features (512 numbers for ResNet-18) feed two outputs, "defective?" (T1) and "which of the 11 labels?"
+# (T2: good + 10 defect types). The training loss is the sum of both, with class weights, so the ~300 good
+# pictures count as much as the ~1,400 defective ones, and every label counts the same.
+
+# %% [markdown]
+# ## Design A: the whole picture
+#
+# Input: the whole ROI shrunk to 768 x 576 px (half resolution), in colour.
+# - **Training** (every run): the two training folds, good and defective (~1,700 pictures). Every time a
+#   picture is read, one of 4 exact versions is picked at random (original, h-flip, v-flip, 180 deg).
+#   AdamW, at most 20 epochs, batches of 8 pictures, weights updated every 8 batches (64 pictures).
+# - **Kept epoch and early stopping**: after every epoch the loss on the validation fold is computed; the
+#   epoch with the lowest validation loss is kept, and training stops when 5 epochs in a row bring no
+#   lower one (the test fold is never looked at). Runs 1-3 were trained for all 20 epochs before early
+#   stopping was added; their kept epochs (6, 18, 4) are the ones early stopping keeps, so only their
+#   training curves are longer.
+# - **Evaluation** as for every method: P(defective) -> percentile among the good validation pictures,
+#   flagged above 95 (T1); the most likely label (T2).
+#
+# About 1.7 min per epoch on the GTX 1650: at most ~35 min per run. A checkpoint is saved
+# after every epoch (data/cnn, ~180 MB per run), so after an interruption Run All continues where it stopped.
+#
+# Result: the kept epochs, the training curves, the T1 table and evaluation figure, the T2 table and
+# confusion matrix, Grad-CAM maps, and the best method of every family.
+
+# %%
+# Train (or load) every CNN in CNN_BACKBONES in all 4 runs; each run is saved when it is done
+cnn_runs = {}  # (backbone, run) -> {"history", "best_epoch", "scores"}
+for name, timm_name in CNN_BACKBONES.items():
+    for run in FOLDS:
+        cnn_runs[(name, run)] = load_or_compute(
+            CACHE_DIR / f"cnn_{name}_whole_run{run}_{data['KEY']}.pkl",
+            lambda: train_cnn(timm_name, eval_info, image_paths, run, t2_classes,
+                              CNN_DIR / f"{name}_whole_run{run}_{data['KEY']}", resume=USE_SAVED_RESULTS),
+            USE_SAVED_RESULTS)
+pd.DataFrame({f"{name} run {run}": {"epochs trained": len(r["history"]),
+                                    "kept epoch": r["best_epoch"],
+                                    "validation loss": round(r["history"]["val_loss"].min(), 3),
+                                    "training loss then": round(r["history"].loc[r["best_epoch"] - 1, "train_loss"], 3),
+                                    "images scored": len(r["scores"])}
+              for (name, run), r in cnn_runs.items()})
+
+# %%
+# Training curves: is the network still learning, or does the validation loss rise again (overfitting)?
+for name in CNN_BACKBONES:
+    fig = plot_training_curves({run: cnn_runs[(name, run)] for run in FOLDS}, f"CNN {name}, whole picture")
+    save_figure(fig, RESULTS_DIR / f"cnn_{name}_whole_training.png", OVERWRITE)
+    plt.show()
+
+# %%
+# T1 (good vs defective): P(defective) with the common evaluation (95th percentile of good validation pictures)
+cnn_results = {}  # method name -> (metrics per run, predictions)
+for name in CNN_BACKBONES:
+    image_scores = pd.DataFrame({run: cnn_runs[(name, run)]["scores"]["p_defect"] for run in FOLDS})
+    cnn_results[f"CNN {name} | whole"] = evaluate_method(image_scores, eval_info, two_sided=False)
+data["CNN"] = pd.DataFrame([
+    {"family": "CNN", **summary_row(method, *result, eval_labels)} for method, result in cnn_results.items()
+])
+save_table(data["CNN"].round(4), RESULTS_DIR / "cnn_summary.csv", OVERWRITE)
+data["CNN"].set_index("method")[
+    ["auroc", "auroc_sd", "balanced_accuracy", "har", "false_alarms_pct", "false_alarms_sd_pct"] + eval_labels[1:]
+].round(2)
+
+# %%
+# Full evaluation figure of every CNN
+for method, result in cnn_results.items():
+    fig = plot_evaluation(*result, eval_labels, method)
+    file_name = method.lower().replace("cnn ", "cnn_").replace(" | ", "_")  # "CNN resnet18 | whole" -> cnn_resnet18_whole
+    save_figure(fig, RESULTS_DIR / f"{file_name}.png", OVERWRITE)
+    plt.show()
+
+# %%
+# T2 (defect type): the most likely of the 11 labels; same table as for the handcrafted features
+cnn_t2_results = {
+    f"CNN {name} | whole": evaluate_multiclass({run: cnn_runs[(name, run)]["scores"][t2_classes] for run in FOLDS},
+                                               eval_info, t2_classes)
+    for name in CNN_BACKBONES
+}
+data["CNN_DEFECT_TYPE"] = pd.DataFrame([
+    {"method": method,
+     **{m: metrics[m].mean() for m in ["accuracy", "mean_recall", "har", "group_accuracy"]},
+     "mean_recall_sd": metrics["mean_recall"].std()}
+    for method, (metrics, _) in cnn_t2_results.items()
+])
+save_table(data["CNN_DEFECT_TYPE"].round(4), RESULTS_DIR / "cnn_defect_type_summary.csv", OVERWRITE)
+data["CNN_DEFECT_TYPE"].round(3)
+
+# %%
+# Confusion matrix of the best CNN (highest mean recall over the 11 labels), and its recall per label
+best_cnn_t2 = data["CNN_DEFECT_TYPE"].sort_values("mean_recall", ascending=False)["method"].iloc[0]
+fig = plot_confusion_matrix(cnn_t2_results[best_cnn_t2][1], t2_classes, TEST_ONLY_LABELS,
+                            f"Defect type, {best_cnn_t2}")
+save_figure(fig, RESULTS_DIR / "cnn_defect_type_confusion.png", OVERWRITE)
+plt.show()
+best_cnn_t2_metrics = cnn_t2_results[best_cnn_t2][0]
+pd.DataFrame({
+    "recall_pct_mean": 100 * best_cnn_t2_metrics[[f"recall_{c}" for c in t2_classes]].mean().to_numpy(),
+    "recall_pct_sd": 100 * best_cnn_t2_metrics[[f"recall_{c}" for c in t2_classes]].std().to_numpy(),
+}, index=t2_classes).round(1)
+
+# %%
+# Grad-CAM: where does the network look when it says "defective"? One random picture per label (the same
+# pictures as in the PatchCore anomaly maps), scored by the run in which it is a test image (F, U, M: run 1).
+# Every map is scaled to 0-1 within its picture, so a good picture also shows its "most defect-like" region.
+for name, timm_name in CNN_BACKBONES.items():
+    predictions = cnn_results[f"CNN {name} | whole"][1].set_index(["run", "file"])
+    model = TwoHeadCNN(timm_name, len(t2_classes)).to(DEVICE)
+    rng = np.random.default_rng(SEED)
+    examples = []
+    for label in eval_labels:
+        files = sorted(eval_info.index[eval_info["label"] == label])
+        file = files[rng.integers(len(files))]
+        fold = eval_info.loc[file, "fold"]
+        run = 1 if pd.isna(fold) else int(fold)
+        model.load_state_dict(torch.load(CNN_DIR / f"{name}_whole_run{run}_{data['KEY']}" / "best.pt",
+                                         map_location=DEVICE))
+        picture, heat, probabilities = cnn_gradcam(model, Path(image_paths[file]), output=0)
+        examples.append({"label": label, "file": file, "run": run, "picture": picture, "map": heat,
+                         "p_defect": probabilities[0], "predicted": t2_classes[int(np.argmax(probabilities[1:]))],
+                         "flagged": bool(predictions.loc[(run, file), "flagged"])})
+    del model
+    torch.cuda.empty_cache()
+    fig = plot_gradcam(examples, f"Grad-CAM, CNN {name} (whole picture): one random picture per label")
+    save_figure(fig, RESULTS_DIR / f"cnn_gradcam_{name}_whole.png", OVERWRITE)
+    plt.show()
+
+# %%
+# All families: the best method of each (highest mean AUROC), now with the CNNs
+families = [("handcrafted one-class", data["ONE_CLASS"]), ("handcrafted supervised", data["SUPERVISED"])] + [
+    (family, table) for family, table in data["DEEP"].groupby("family")
+] + [("anomaly detection", data["ANOMALY_ALL"]),
+      ("combined", data["COMBINED"].loc[data["COMBINED"]["combination"] != "alone"]), ("CNN", data["CNN"])]
+pd.concat([
+    table.sort_values("auroc", ascending=False).head(1).assign(family=family) for family, table in families
+]).set_index("family")[["method", "auroc", "balanced_accuracy", "har", "false_alarms_pct"] + eval_labels[1:]].round(2)
 
 # %% [markdown]
 # # Experiments
