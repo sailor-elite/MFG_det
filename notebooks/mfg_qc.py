@@ -29,6 +29,7 @@ import pickle
 import re
 import shutil
 import time
+from collections.abc import Iterator
 from concurrent.futures import ProcessPoolExecutor
 from datetime import datetime
 from functools import partial
@@ -41,6 +42,8 @@ import pandas as pd
 import timm
 import torch
 from anomalib.models.components.sampling import KCenterGreedy
+from anomalib.models.image.dfm.torch_model import DFMModel
+from anomalib.models.image.padim.torch_model import PadimModel
 from anomalib.models.image.patchcore.torch_model import PatchcoreModel
 from lightgbm import LGBMClassifier
 from matplotlib.patches import Rectangle
@@ -259,6 +262,18 @@ PATCHCORE_LAYERS = ["layer2", "layer3"]  # mid-level feature maps: 48 x 48 patch
 PATCHCORE_KEEP_SHARE = 0.025  # random share of the patches of every good training image kept (~220,000 per run)
 PATCHCORE_BANK_SIZE = 10_000  # memory bank: patches that anomalib's coreset selection picks from the kept ones
 PATCHCORE_NEIGHBORS = 9       # anomalib default: the tile score is reweighted using 9 nearest bank patches
+# DFM (anomalib defaults, same network as PatchCore): every tile = its layer3 feature map averaged down to
+# 6 x 6 cells (256 x 36 = 9,216 numbers); a PCA learns the main patterns of the good tiles
+DFM_BACKBONE = PATCHCORE_BACKBONE
+DFM_LAYER = "layer3"
+DFM_POOLING = 4       # average 4 x 4 cells of the 24 x 24 feature map -> 6 x 6
+DFM_VARIANCE = 0.97   # PCA keeps the patterns that explain 97 % of the variation of the good tiles
+# PaDiM (paper defaults for ResNet-18, same network as PatchCore): one Gaussian per patch position
+# (96 x 96 positions per tile), from a random subset of the feature-map channels
+PADIM_BACKBONE = PATCHCORE_BACKBONE
+PADIM_LAYERS = ["layer1", "layer2", "layer3"]
+PADIM_FEATURES = 100  # random subset of the 64 + 128 + 256 = 448 channels (the same subset in every run)
+PADIM_BATCH_IMAGES = 1  # images per GPU batch: anomalib first builds all 448 channels (~0.2 GB per image)
 
 data = {}
 
@@ -1833,12 +1848,55 @@ def make_patchcore() -> PatchcoreModel:
                           num_neighbors=PATCHCORE_NEIGHBORS).to(DEVICE)
 
 
-def patchcore_input(tiles: torch.Tensor, model: PatchcoreModel) -> torch.Tensor:
-    """Turn uint8 tiles into the normalised float input of the PatchCore backbone (no resizing).
+def tile_batches(paths: list[Path], desc: str, batch_images: int = DEEP_BATCH_IMAGES) -> Iterator[torch.Tensor]:
+    """Yield the 12 native tiles of the images, a few images at a time, with a progress bar.
 
     Args:
-        tiles (torch.Tensor): uint8 RGB tiles of shape (n_images, 12, 384, 384, 3), e.g. from ModelInputs.
-        model (PatchcoreModel): from make_patchcore (its backbone's ImageNet mean and SD are used).
+        paths (list[Path]): image files, e.g. the ~320 good training images of one run.
+        desc (str): label of the progress bar, e.g. "run 1: scoring".
+        batch_images (int): images per batch, e.g. DEEP_BATCH_IMAGES = 4 (48 tiles).
+
+    Yields:
+        torch.Tensor: uint8 RGB tiles of shape (n_images, 12, 384, 384, 3), read in DATA_WORKERS processes.
+    """
+    loader = DataLoader(ModelInputs(paths, ROI, CROP_SIZE, WHOLE_SIZE), batch_size=batch_images,
+                        num_workers=DATA_WORKERS)
+    with tqdm(total=len(paths), desc=desc, unit="image") as progress:
+        for tiles, _ in loader:
+            yield tiles
+            progress.update(tiles.shape[0])
+
+
+def anomaly_run_images(info: pd.DataFrame, run: int) -> tuple[pd.Index, pd.Index]:
+    """Return the images an anomaly model learns from and the images it scores in one run.
+
+    Learns from: the good images of the two training folds. Scores: the test fold, the test-only images
+    (F, U, M) and the good validation images (for the cut). Not scored: the training images and the
+    defective validation images (the evaluation does not use them).
+
+    Args:
+        info (pd.DataFrame): index = file, columns fold and label (images that are not excluded),
+            e.g. eval_info.
+        run (int): evaluation run, 1-4 (= the test fold).
+
+    Returns:
+        tuple[pd.Index, pd.Index]: names of the training images (e.g. 312) and of the scored images
+            (e.g. 2,100).
+    """
+    roles = run_roles(info["fold"], run)
+    good = info["label"] == "good"
+    train = info.index[(roles == "train") & good]
+    scored = info.index[roles.isin(["test", "test_only"]) | ((roles == "validation") & good)]
+    return train, scored
+
+
+def anomaly_input(tiles: torch.Tensor, model: torch.nn.Module) -> torch.Tensor:
+    """Turn uint8 tiles into the normalised float input of an anomalib model's backbone (no resizing).
+
+    Args:
+        tiles (torch.Tensor): uint8 RGB tiles of shape (n_images, 12, 384, 384, 3), e.g. from tile_batches.
+        model (torch.nn.Module): an anomalib model (PatchCore, DFM or PaDiM); its backbone's ImageNet
+            mean and SD are used.
 
     Returns:
         torch.Tensor: float32 on DEVICE, shape (n_images * 12, 3, 384, 384).
@@ -1847,7 +1905,7 @@ def patchcore_input(tiles: torch.Tensor, model: PatchcoreModel) -> torch.Tensor:
     mean = torch.tensor(config["mean"], device=DEVICE).view(1, 3, 1, 1)
     std = torch.tensor(config["std"], device=DEVICE).view(1, 3, 1, 1)
     x = tiles.to(DEVICE).flatten(0, 1).permute(0, 3, 1, 2).float() / 255
-    return (x - mean) / std
+    return ((x - mean) / std).contiguous()  # standard memory order (DFM reshapes the feature maps)
 
 
 def patchcore_memory_bank(model: PatchcoreModel, paths: list[Path], seed: int, desc: str) -> torch.Tensor:
@@ -1870,59 +1928,53 @@ def patchcore_memory_bank(model: PatchcoreModel, paths: list[Path], seed: int, d
         torch.Tensor: float32 on DEVICE, shape (PATCHCORE_BANK_SIZE, 384).
     """
     torch.manual_seed(seed)
+    np.random.seed(seed)  # anomalib's coreset selection also draws from numpy's global random generator
     model.train()  # anomalib: in training mode the model returns the patch features (backbone stays in eval)
-    loader = DataLoader(ModelInputs(paths, ROI, CROP_SIZE, WHOLE_SIZE), batch_size=DEEP_BATCH_IMAGES,
-                        num_workers=DATA_WORKERS)
-    progress = tqdm(total=len(paths), desc=desc, unit="image")
     kept = []
     with torch.no_grad():
-        for tiles, _ in loader:
-            features = model(patchcore_input(tiles, model))  # (n_images * 12 * 2304, 384)
+        for tiles in tile_batches(paths, desc):
+            features = model(anomaly_input(tiles, model))  # (n_images * 12 * 2304, 384)
             model.embedding_store.clear()  # anomalib would keep all features; only a random sample is kept
             n_keep = round(PATCHCORE_KEEP_SHARE * len(features))
             kept.append(features[torch.randperm(len(features), device=features.device)[:n_keep]])
-            progress.update(tiles.shape[0])
-    progress.close()
     kept = torch.cat(kept)
     sampler = KCenterGreedy(embedding=kept, sampling_ratio=(PATCHCORE_BANK_SIZE + 0.5) / len(kept))
     return sampler.sample_coreset()  # shows its own progress bar ("Selecting Coreset Indices")
 
 
-def patchcore_tile_scores(model: PatchcoreModel, paths: list[Path], desc: str) -> np.ndarray:
-    """Score every tile with PatchCore: how far its most unusual patch is from all good patches.
+def anomaly_tile_scores(model: torch.nn.Module, paths: list[Path], desc: str,
+                        batch_images: int = DEEP_BATCH_IMAGES) -> np.ndarray:
+    """Score every tile with a fitted anomalib model (PatchCore, DFM or PaDiM). Higher = more unusual.
 
-    Every patch of a tile looks for its nearest patch in the memory bank (Euclidean distance). The tile
-    score is the largest of these distances, slightly reweighted by anomalib (by how isolated the
-    nearest bank patch is among its PATCHCORE_NEIGHBORS neighbours). Higher = more unusual.
+    - PatchCore: distance of the tile's most unusual patch to its nearest patch in the memory bank,
+      slightly reweighted by anomalib (by how isolated that bank patch is among its
+      PATCHCORE_NEIGHBORS neighbours);
+    - DFM: how badly the main patterns of the good tiles rebuild the tile's features
+      (feature reconstruction error);
+    - PaDiM: the largest Mahalanobis distance of a patch from the good patches at the same position
+      (after anomalib's smoothing).
 
     Args:
-        model (PatchcoreModel): with its memory bank set (model.memory_bank).
+        model (torch.nn.Module): a fitted anomalib model, e.g. PatchCore with its memory bank set.
         paths (list[Path]): images to score, e.g. the ~2,100 images of one run.
         desc (str): label of the progress bar, e.g. "run 1: scoring".
+        batch_images (int): images per GPU batch, e.g. DEEP_BATCH_IMAGES = 4 or PADIM_BATCH_IMAGES = 1.
 
     Returns:
         np.ndarray: float32, shape (n_images, 12): one score per tile, in tile_idx order.
     """
     model.eval()
-    loader = DataLoader(ModelInputs(paths, ROI, CROP_SIZE, WHOLE_SIZE), batch_size=DEEP_BATCH_IMAGES,
-                        num_workers=DATA_WORKERS)
-    progress = tqdm(total=len(paths), desc=desc, unit="image")
     scores = []
     with torch.no_grad():
-        for tiles, _ in loader:
-            out = model(patchcore_input(tiles, model))
+        for tiles in tile_batches(paths, desc, batch_images):
+            out = model(anomaly_input(tiles, model))
             scores.append(out.pred_score.reshape(tiles.shape[0], -1).cpu().numpy())
-            progress.update(tiles.shape[0])
-    progress.close()
     return np.concatenate(scores)
 
 
 def run_patchcore(info: pd.DataFrame, paths: pd.Series, run: int) -> dict:
-    """Train PatchCore on the good training images of one run and score the images that run needs.
-
-    Scored: the test fold, the test-only images (F, U, M) and the good validation images (for the cut).
-    Not scored: the training images (their patches are in the memory bank) and the defective
-    validation images (the evaluation does not use them).
+    """Train PatchCore on the good training images of one run and score the images that run needs
+    (see anomaly_run_images).
 
     Args:
         info (pd.DataFrame): index = file, columns fold and label (images that are not excluded),
@@ -1934,18 +1986,118 @@ def run_patchcore(info: pd.DataFrame, paths: pd.Series, run: int) -> dict:
         dict: "bank" (np.ndarray float32 of shape (PATCHCORE_BANK_SIZE, 384): the memory bank) and
             "tile_scores" (pd.DataFrame: index = file of the scored images, columns 0-11 = tile_idx).
     """
-    roles = run_roles(info["fold"], run)
-    good = info["label"] == "good"
-    train = info.index[(roles == "train") & good]
-    scored = info.index[roles.isin(["test", "test_only"]) | ((roles == "validation") & good)]
+    train, scored = anomaly_run_images(info, run)
     model = make_patchcore()
     model.memory_bank = patchcore_memory_bank(model, [Path(paths[f]) for f in train], SEED + run,
                                               f"run {run}: memory bank from {len(train)} good images")
-    tile_scores = patchcore_tile_scores(model, [Path(paths[f]) for f in scored], f"run {run}: scoring")
+    tile_scores = anomaly_tile_scores(model, [Path(paths[f]) for f in scored], f"run {run}: scoring")
     bank = model.memory_bank.cpu().numpy()
     del model
     torch.cuda.empty_cache()
     return {"bank": bank, "tile_scores": pd.DataFrame(tile_scores, index=scored)}
+
+
+def make_dfm() -> DFMModel:
+    """Create anomalib's DFM model with a pretrained backbone (not fitted yet), on DEVICE.
+
+    Returns:
+        DFMModel: backbone DFM_BACKBONE, features from DFM_LAYER averaged over DFM_POOLING x DFM_POOLING
+            cells, PCA keeping DFM_VARIANCE of the variation, score = feature reconstruction error ("fre").
+    """
+    return DFMModel(backbone=DFM_BACKBONE, layer=DFM_LAYER, pre_trained=True, pooling_kernel_size=DFM_POOLING,
+                    n_comps=DFM_VARIANCE, score_type="fre").to(DEVICE)
+
+
+def fit_dfm(model: DFMModel, paths: list[Path], desc: str) -> None:
+    """Fit DFM on good training images: a PCA of the features of all their tiles (anomalib's own fit).
+
+    Every tile becomes 9,216 numbers (its layer3 feature map averaged down to 6 x 6 cells). For ~320
+    images that is 3,840 x 9,216 numbers (~140 MB), small enough for anomalib to keep all of them. The
+    PCA then finds the main patterns of the good tiles; a tile they rebuild badly is unusual.
+
+    Args:
+        model (DFMModel): from make_dfm.
+        paths (list[Path]): good training images, e.g. the ~320 good images of the two training folds.
+        desc (str): label of the progress bar, e.g. "run 1: fit on 312 good images".
+    """
+    model.train()  # anomalib: in training mode the model keeps the tile features (backbone stays in eval)
+    with torch.no_grad():
+        for tiles in tile_batches(paths, desc):
+            model(anomaly_input(tiles, model))
+        model.fit()
+
+
+def make_padim() -> PadimModel:
+    """Create anomalib's PaDiM model with a pretrained backbone (not fitted yet), on DEVICE.
+
+    Returns:
+        PadimModel: backbone PADIM_BACKBONE, features from PADIM_LAYERS (all enlarged to the 96 x 96 grid
+            of layer1), PADIM_FEATURES randomly chosen channels (seed torch first for the same choice).
+    """
+    return PadimModel(backbone=PADIM_BACKBONE, layers=PADIM_LAYERS, pre_trained=True,
+                      n_features=PADIM_FEATURES).to(DEVICE)
+
+
+def fit_padim(model: PadimModel, paths: list[Path], desc: str) -> None:
+    """Fit PaDiM on good training images: one Gaussian (mean and covariance) per patch position.
+
+    anomalib keeps all training features before fitting (3,840 tiles x 100 x 96 x 96 numbers, ~14 GB
+    for ~320 images). Here the sums are added up batch by batch instead (in float64), which gives the
+    same Gaussians as anomalib: covariance = (sum of x x^T - n mean mean^T) / (n - 1) + 0.01 I
+    (anomalib's regularisation, plus its 1e-5 I), then inverted.
+
+    Args:
+        model (PadimModel): from make_padim.
+        paths (list[Path]): good training images, e.g. the ~320 good images of the two training folds.
+        desc (str): label of the progress bar, e.g. "run 1: fit on 312 good images".
+    """
+    model.train()  # anomalib: in training mode the model returns the patch features (backbone stays in eval)
+    n = 0
+    with torch.no_grad():
+        for tiles in tile_batches(paths, desc, PADIM_BATCH_IMAGES):
+            features = model(anomaly_input(tiles, model))  # (n_tiles, 100, 96, 96)
+            model.memory_bank.clear()  # anomalib would keep all features
+            x = features.flatten(2).double().permute(2, 1, 0)  # (positions, 100, n_tiles)
+            if n == 0:
+                sum_x = torch.zeros(x.shape[:2], dtype=torch.float64, device=x.device)
+                sum_xx = torch.zeros(x.shape[0], x.shape[1], x.shape[1], dtype=torch.float64, device=x.device)
+            sum_x += x.sum(dim=2)
+            sum_xx.baddbmm_(x, x.transpose(1, 2))  # adds x x^T at every position, in place
+            n += x.shape[2]
+        mean = sum_x / n  # (positions, 100)
+        sum_xx.baddbmm_(mean.unsqueeze(2), mean.unsqueeze(1), alpha=-n).div_(n - 1)  # now the covariance
+        covariance = sum_xx.float()
+        del sum_xx
+        covariance += (0.01 + 1e-5) * torch.eye(covariance.shape[1], device=covariance.device)
+        model.gaussian.mean = mean.T.float().contiguous()             # (100, positions), as anomalib stores it
+        model.gaussian.inv_covariance = torch.linalg.inv(covariance)  # (positions, 100, 100)
+
+
+def run_anomaly_model(info: pd.DataFrame, paths: pd.Series, run: int, make_model, fit_model,
+                      batch_images: int) -> pd.DataFrame:
+    """Fit an anomalib model (DFM or PaDiM) on the good training images of one run and score the images
+    that run needs (see anomaly_run_images).
+
+    Args:
+        info (pd.DataFrame): index = file, columns fold and label (images that are not excluded),
+            e.g. eval_info.
+        paths (pd.Series): index = file, the path of every image.
+        run (int): evaluation run, 1-4 (= the test fold).
+        make_model (callable): makes the unfitted model, e.g. make_dfm.
+        fit_model (callable): fits it on good images, e.g. fit_dfm.
+        batch_images (int): images per GPU batch when scoring, e.g. DEEP_BATCH_IMAGES or PADIM_BATCH_IMAGES.
+
+    Returns:
+        pd.DataFrame: index = file of the scored images, columns 0-11 = tile score (tile_idx).
+    """
+    train, scored = anomaly_run_images(info, run)
+    torch.manual_seed(SEED)  # PaDiM: the same random channel subset in every run
+    model = make_model()
+    fit_model(model, [Path(paths[f]) for f in train], f"run {run}: fit on {len(train)} good images")
+    tile_scores = anomaly_tile_scores(model, [Path(paths[f]) for f in scored], f"run {run}: scoring", batch_images)
+    del model
+    torch.cuda.empty_cache()
+    return pd.DataFrame(tile_scores, index=scored)
 
 
 def patchcore_map(model: PatchcoreModel, path: Path) -> tuple[np.ndarray, np.ndarray]:
@@ -1964,7 +2116,7 @@ def patchcore_map(model: PatchcoreModel, path: Path) -> tuple[np.ndarray, np.nda
     tiles = torch.from_numpy(cut_tiles(roi_img, CROP_SIZE)).unsqueeze(0)  # (1, 12, 384, 384, 3)
     model.eval()
     with torch.no_grad():
-        maps = model(patchcore_input(tiles, model)).anomaly_map.squeeze(1).cpu().numpy()  # (12, 384, 384)
+        maps = model(anomaly_input(tiles, model)).anomaly_map.squeeze(1).cpu().numpy()  # (12, 384, 384)
     rows, cols = roi_img.shape[0] // CROP_SIZE, roi_img.shape[1] // CROP_SIZE
     # inverse of cut_tiles: (rows * cols, t, t) -> (rows, cols, t, t) -> (rows, t, cols, t) -> (rows * t, cols * t)
     full = maps.reshape(rows, cols, CROP_SIZE, CROP_SIZE).transpose(0, 2, 1, 3)
@@ -3196,6 +3348,78 @@ plt.show()
 families = [("handcrafted one-class", data["ONE_CLASS"]), ("handcrafted supervised", data["SUPERVISED"])] + [
     (family, table) for family, table in data["DEEP"].groupby("family")
 ] + [("anomaly detection", data["ANOMALY"])]
+pd.concat([
+    table.sort_values("auroc", ascending=False).head(1).assign(family=family) for family, table in families
+]).set_index("family")[["method", "auroc", "balanced_accuracy", "har", "false_alarms_pct"] + eval_labels[1:]].round(2)
+
+# %% [markdown]
+# ## DFM and PaDiM
+#
+# Two more anomalib models with the same network (ResNet-18), tiles, runs and evaluation as PatchCore.
+# Both learn from the good training images only:
+# - **DFM** looks at every tile as a whole: its layer3 feature map averaged down to 6 x 6 cells
+#   (9,216 numbers). A PCA learns the main patterns of the good tiles (those that explain 97 % of their
+#   variation). Tile score = how badly these patterns rebuild the tile's numbers (reconstruction error).
+#   Example: a tile whose cells are all shifted the same way (e.g. a colour cast) is rebuilt badly,
+#   even if every single patch would still look normal on its own.
+# - **PaDiM** compares patches position by position: for each of the 96 x 96 patch positions of a tile it
+#   learns the average and spread (a Gaussian) of 100 feature numbers over all good tiles. Tile score =
+#   the largest distance (Mahalanobis) of a patch from the good patches at the same position. Our fields
+#   are chosen freely, so a position inside a tile has no fixed content: PaDiM is kept to test whether
+#   this per-position idea suits our images.
+#
+# Image score: highest tile score ("tiles max") or mean of the 12 ("tiles mean"), as for PatchCore.
+# About 10 min (DFM) and 15-20 min (PaDiM) for all 4 runs; saved per run (tile scores only).
+
+# %%
+# DFM and PaDiM in all 4 runs: fit on the good training images, then scores of 12 tiles per image
+anomaly_models = {  # name -> (make the model, fit it on good images, backbone, images per GPU batch)
+    "DFM": (make_dfm, fit_dfm, DFM_BACKBONE, DEEP_BATCH_IMAGES),
+    "PaDiM": (make_padim, fit_padim, PADIM_BACKBONE, PADIM_BATCH_IMAGES),
+}
+anomaly_tile_tables = {}  # (name, run) -> tile scores (index = file, columns 0-11)
+for name, (make, fit, backbone, batch_images) in anomaly_models.items():
+    for run in FOLDS:
+        anomaly_tile_tables[(name, run)] = load_or_compute(
+            CACHE_DIR / f"{name.lower()}_{backbone.split('.')[0]}_run{run}_{data['KEY']}.pkl",
+            lambda: run_anomaly_model(eval_info, image_paths, run, make, fit, batch_images), USE_SAVED_RESULTS)
+pd.DataFrame({f"{name} run {run}": {"images scored": len(t)} for (name, run), t in anomaly_tile_tables.items()})
+
+# %%
+# All anomaly models (PatchCore above, DFM, PaDiM): image score from the tile scores, then the common evaluation
+anomaly_results = dict(patchcore_results)  # method name -> (metrics per run, predictions)
+for name, (_, _, backbone, _) in anomaly_models.items():
+    for agg in ("max", "mean"):
+        image_scores = pd.DataFrame({run: anomaly_tile_tables[(name, run)].agg(agg, axis=1) for run in FOLDS})
+        anomaly_results[f"{name} {backbone.split('.')[0]} | tiles {agg}"] = evaluate_method(
+            image_scores, eval_info, two_sided=False)
+data["ANOMALY_ALL"] = pd.DataFrame([
+    {"family": "anomaly detection", **summary_row(method, *result, eval_labels)}
+    for method, result in anomaly_results.items()
+])
+save_table(data["ANOMALY_ALL"].round(4), RESULTS_DIR / "anomaly_all_summary.csv", OVERWRITE)
+data["ANOMALY_ALL"].set_index("method")[
+    ["auroc", "auroc_sd", "balanced_accuracy", "har", "false_alarms_pct", "false_alarms_sd_pct"] + eval_labels[1:]
+].round(2)
+
+# %%
+fig = plot_detection_heatmap(data["ANOMALY_ALL"], eval_labels,
+                             f"Anomaly detection (anomalib, {patchcore_name}, learned from good tiles only)")
+save_figure(fig, RESULTS_DIR / "anomaly_all_heatmap.png", OVERWRITE)
+plt.show()
+
+# %%
+# Best anomaly model: full evaluation figure
+best_anomaly_all = data["ANOMALY_ALL"].sort_values("auroc", ascending=False)["method"].iloc[0]
+fig = plot_evaluation(*anomaly_results[best_anomaly_all], eval_labels, f"Best anomaly detection: {best_anomaly_all}")
+save_figure(fig, RESULTS_DIR / "anomaly_all_best.png", OVERWRITE)
+plt.show()
+
+# %%
+# All families: the best method of each (highest mean AUROC), now with all three anomaly models
+families = [("handcrafted one-class", data["ONE_CLASS"]), ("handcrafted supervised", data["SUPERVISED"])] + [
+    (family, table) for family, table in data["DEEP"].groupby("family")
+] + [("anomaly detection", data["ANOMALY_ALL"])]
 pd.concat([
     table.sort_values("auroc", ascending=False).head(1).assign(family=family) for family, table in families
 ]).set_index("family")[["method", "auroc", "balanced_accuracy", "har", "false_alarms_pct"] + eval_labels[1:]].round(2)
