@@ -275,6 +275,20 @@ PADIM_LAYERS = ["layer1", "layer2", "layer3"]
 PADIM_FEATURES = 100  # random subset of the 64 + 128 + 256 = 448 channels (the same subset in every run)
 PADIM_BATCH_IMAGES = 1  # images per GPU batch: anomalib first builds all 448 channels (~0.2 GB per image)
 
+# Combining methods (saved scores, no training); names as in the "method" column of the summary tables
+MAX_RULE_PAIR = [  # max rule: the higher unusualness of the two, then the usual 95th-percentile cut
+    "dinov2_vits14 Logistic regression | whole",  # strong on everything except frozen milk
+    "DFM resnet18 | tiles mean",                  # catches frozen milk, misses sparse fields
+]
+VOTERS = [  # voting: the best method of each family, each decides on its own (unusualness > 95)
+    "Mahalanobis | whole",                        # handcrafted one-class
+    "HistGradientBoosting | tiles max",           # handcrafted supervised
+    "dinov2_vits14 LOF | whole",                  # deep one-class
+    "dinov2_vits14 Logistic regression | whole",  # deep supervised
+    "DFM resnet18 | tiles mean",                  # anomaly detection
+]
+VOTES_NEEDED = [1, 2, 3, 4, 5]  # flag an image if at least this many voters flag it (3 = majority)
+
 data = {}
 
 # %% [markdown]
@@ -1169,7 +1183,7 @@ def harmonic_mean(values: list[float]) -> float:
 
 
 def evaluate_method(
-    scores: pd.DataFrame, info: pd.DataFrame, two_sided: bool
+    scores: pd.DataFrame, info: pd.DataFrame, two_sided: bool, cut: float | None = None
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Evaluate one method in all runs with the common rules (percentile of good validation, 95 % cut).
 
@@ -1180,6 +1194,8 @@ def evaluate_method(
             (PatchCore scores only these; the other images may be NaN).
         info (pd.DataFrame): index = file (images that are not excluded), columns fold, label, is_defect.
         two_sided (bool): True for single features (a defect can move them either way).
+        cut (float | None): None = the common rule (flag if u > FLAG_PERCENTILE); a number = flag
+            the images whose score is above it instead, e.g. 2.5 for votes: "at least 3 of 5 models".
 
     Returns:
         tuple[pd.DataFrame, pd.DataFrame]:
@@ -1204,7 +1220,7 @@ def evaluate_method(
                              "the saved results are out of date: set USE_SAVED_RESULTS = False")
         good_val = s[(roles == "validation") & (info["label"] == "good")]
         u = pd.Series(unusualness(s, good_val, two_sided), index=info.index)
-        flagged = u > FLAG_PERCENTILE
+        flagged = u > FLAG_PERCENTILE if cut is None else s > cut
         if two_sided:  # for AUROC / ROC only: u with its ties at 100 broken (decisions use u)
             ranking = pd.Series(two_sided_score(s, good_val), index=info.index)
         else:
@@ -2162,6 +2178,30 @@ def plot_anomaly_maps(examples: list[dict], vmin: float, vmax: float, title: str
     fig.colorbar(image, ax=axes, shrink=0.5, label="patch distance / cut of the run (1 = cut)")
     fig.suptitle(title, fontsize=13)
     return fig
+
+
+def run_unusualness(scores: pd.DataFrame, info: pd.DataFrame) -> pd.DataFrame:
+    """Return every image's unusualness (0-100) in every run, as evaluate_method computes it.
+
+    u = percentile of the image's score among the scores of the good validation images of the run
+    (one-sided, higher score = more defective), so u > FLAG_PERCENTILE is the method's own decision.
+    Example: a score above 152 of the 156 good validation scores gives u = 97.4 (flagged).
+
+    Args:
+        scores (pd.DataFrame): index = file, one column per run (1-4), e.g. method_scores["Mahalanobis | whole"].
+        info (pd.DataFrame): index = file (images that are not excluded), columns fold, label.
+
+    Returns:
+        pd.DataFrame: index = info.index, one column per run with u; NaN where the method has no
+            score (e.g. training images, which DFM and PatchCore do not score).
+    """
+    out = {}
+    for run in scores.columns:
+        roles = run_roles(info["fold"], run)
+        s = scores[run].reindex(info.index)
+        good_val = s[(roles == "validation") & (info["label"] == "good")]
+        out[run] = pd.Series(unusualness(s, good_val, two_sided=False), index=info.index).where(s.notna())
+    return pd.DataFrame(out)
 
 
 # %% [markdown]
@@ -3200,6 +3240,7 @@ pd.DataFrame({
 # %%
 deep_rows = []     # one summary row per method (backbone x model x input)
 deep_results = {}  # method name -> (metrics per run, predictions), for the figures below
+deep_image_scores = {}  # (backbone, family) -> image scores of all its models (for "Combining methods")
 for backbone, features in deep_features.items():  # every backbone in DEEP_BACKBONES
     # Deep features as tables like the handcrafted ones: 768 columns d000-d767, per whole picture / per tile
     whole_table, tile_table = deep_feature_tables(features)
@@ -3213,6 +3254,7 @@ for backbone, features in deep_features.items():  # every backbone in DEEP_BACKB
             lambda: run_models(models, whole_table, tile_table, eval_info, score_fn, desc=f"{backbone} {family}"),
             USE_SAVED_RESULTS,
         )
+        deep_image_scores[(backbone, family)] = scores
         # Same evaluation as everything else: 95th-percentile cut on good validation images, 4 runs
         for (name, input_name), image_scores in scores.items():
             method = f"{backbone} {name} | {input_name}"
@@ -3423,6 +3465,86 @@ families = [("handcrafted one-class", data["ONE_CLASS"]), ("handcrafted supervis
 pd.concat([
     table.sort_values("auroc", ascending=False).head(1).assign(family=family) for family, table in families
 ]).set_index("family")[["method", "auroc", "balanced_accuracy", "har", "false_alarms_pct"] + eval_labels[1:]].round(2)
+
+# %% [markdown]
+# # Combining methods
+#
+# No single method catches everything. DINOv2 logistic regression catches almost every defect but only
+# about half of the frozen milk; DFM catches frozen milk (99 %) but almost no overstained or overdiluted
+# fields. Two ways to combine methods, both from the saved scores (nothing is trained again):
+# - **Max rule** (the two models in `MAX_RULE_PAIR`): every image gets each model's unusualness (0-100, its
+#   percentile among the good validation images, as in every evaluation). The combined score is the higher
+#   of the two. Then the usual rule: flagged if the combined score is above the 95th percentile of the good
+#   validation images' combined scores, so the false-alarm target on validation stays at 5 %.
+#   Example (run 1): the frozen image F02_0059 gets u = 45.5 from logistic regression (passed) and u = 100
+#   from DFM, so its combined score is 100. The cut of run 1 is a combined score of 97.3: flagged.
+# - **Voting** (the five models in `VOTERS`, the best method of each family): every model decides on its own
+#   (flagged if its unusualness > 95), and the image is flagged if at least k of the 5 flag it, for every k
+#   in `VOTES_NEEDED` (k = 1: any model is enough; k = 3: majority; k = 5: all five must agree).
+#   Example (run 1): 3 of the 5 models flag F02_0059: flagged with k = 1, 2 or 3, passed with k = 4 or 5.
+#   For voting, AUROC uses the number of votes (0-5) as the score, so it is the same for every k;
+#   k only moves the cut along the same ROC curve.
+#
+# Result: a table and heat map of the five methods alone, the max rule and every vote, and the full
+# evaluation figures of the max rule and of the majority vote.
+
+# %%
+# Image scores of every method by its name in the summary tables (e.g. "Mahalanobis | whole"), 4 runs each
+method_scores = {f"{name} | {input_name}": s
+                 for (name, input_name), s in {**one_class_image_scores, **supervised_image_scores}.items()}
+for (backbone, family), scores in deep_image_scores.items():
+    method_scores.update({f"{backbone} {name} | {input_name}": s for (name, input_name), s in scores.items()})
+for agg in ("max", "mean"):  # anomaly models: image score from the 12 tile scores
+    method_scores[f"PatchCore {patchcore_name} | tiles {agg}"] = pd.DataFrame(
+        {run: r["tile_scores"].agg(agg, axis=1) for run, r in patchcore_runs.items()})
+    for name, (_, _, backbone, _) in anomaly_models.items():
+        method_scores[f"{name} {backbone.split('.')[0]} | tiles {agg}"] = pd.DataFrame(
+            {run: anomaly_tile_tables[(name, run)].agg(agg, axis=1) for run in FOLDS})
+
+# Unusualness (0-100) of every image in every run, for the models combined below
+unusual = {method: run_unusualness(method_scores[method], eval_info) for method in dict.fromkeys(VOTERS + MAX_RULE_PAIR)}
+
+combined_results = {}  # method name -> (metrics per run, predictions)
+for method in VOTERS:  # every voter alone, for comparison
+    combined_results[method] = evaluate_method(method_scores[method], eval_info, two_sided=False)
+# Max rule: the higher of the two unusualness values, then the usual 95th-percentile cut
+max_rule = np.maximum(unusual[MAX_RULE_PAIR[0]], unusual[MAX_RULE_PAIR[1]])
+combined_results["max rule (2 models)"] = evaluate_method(max_rule, eval_info, two_sided=False)
+# Voting: how many voters flag the image (0-5); flagged if at least k of them do
+votes = sum((unusual[method] > FLAG_PERCENTILE).astype(float).where(unusual[method].notna()) for method in VOTERS)
+for k in VOTES_NEEDED:
+    combined_results[f"vote: at least {k} of {len(VOTERS)}"] = evaluate_method(votes, eval_info, two_sided=False,
+                                                                               cut=k - 0.5)
+data["COMBINED"] = pd.DataFrame([
+    {"combination": "max rule" if method.startswith("max") else "voting" if method.startswith("vote") else "alone",
+     **summary_row(method, *result, eval_labels)}
+    for method, result in combined_results.items()
+])
+save_table(data["COMBINED"].round(4), RESULTS_DIR / "combined_summary.csv", OVERWRITE)
+data["COMBINED"].set_index("method")[
+    ["auroc", "auroc_sd", "balanced_accuracy", "har", "false_alarms_pct", "false_alarms_sd_pct"] + eval_labels[1:]
+].round(2)
+
+# %%
+fig = plot_detection_heatmap(data["COMBINED"], eval_labels,
+                             "Combining methods: the five voters alone, the max rule of two, and voting (at least k of 5)")
+save_figure(fig, RESULTS_DIR / "combined_heatmap.png", OVERWRITE)
+plt.show()
+
+# %%
+# Max rule: full evaluation figure
+fig = plot_evaluation(*combined_results["max rule (2 models)"], eval_labels,
+                      f"Max rule: {MAX_RULE_PAIR[0]} + {MAX_RULE_PAIR[1]}")
+save_figure(fig, RESULTS_DIR / "combined_max_rule.png", OVERWRITE)
+plt.show()
+
+# %%
+# Majority vote: full evaluation figure (ROC curve of the number of votes; the dot is "at least 3 of 5")
+majority = len(VOTERS) // 2 + 1
+fig = plot_evaluation(*combined_results[f"vote: at least {majority} of {len(VOTERS)}"], eval_labels,
+                      f"Majority vote: at least {majority} of {len(VOTERS)} models")
+save_figure(fig, RESULTS_DIR / "combined_majority_vote.png", OVERWRITE)
+plt.show()
 
 # %% [markdown]
 # # Experiments
