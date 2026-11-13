@@ -294,7 +294,10 @@ VOTES_NEEDED = [1, 2, 3, 4, 5]  # flag an image if at least this many voters fla
 # CNNs (CLAUDE.md §9 Step 5): ImageNet networks fine-tuned with two outputs, good vs defective (T1) and
 # which label (T2). Design A: the whole picture (WHOLE_SIZE). Trained in fp32: fp16 overflows in these
 # networks (NaN) and was 4x slower on the GTX 1650 (speed test: 22.5 training images/s, 1.75 GB GPU).
-CNN_BACKBONES = {"resnet18": "resnet18.a1_in1k"}  # short name -> timm name (same weights as above)
+CNN_BACKBONES = {"resnet18": "resnet18.a1_in1k",  # short name -> timm name (same weights as above)
+                 "resnet50": "resnet50.a1_in1k"}
+CNN_GRAD_CHECKPOINTING = ["resnet50"]  # recompute activations in the backward pass instead of storing them:
+                     # ResNet-50 needs > 4 GB GPU at batch 8 without it, 2.8 GB with it (6.0 images/s)
 CNN_EPOCHS = 20      # at most this many passes over the training images (the learning rate is planned for 20)
 CNN_PATIENCE = 5     # early stopping: stop when the validation loss has not improved for 5 epochs;
                      # the epoch with the lowest validation loss is kept
@@ -2253,16 +2256,23 @@ class TwoHeadCNN(torch.nn.Module):
     The network's pooled features (512 numbers for ResNet-18) feed two linear layers: one number for
     "defective?" and one number per label.
 
+    Gradient checkpointing (optional, for ResNet-50 on 4 GB): while training, the activations of layer1-4
+    are not stored but recomputed in the backward pass. The gradients are the same (tested), but every
+    BatchNorm layer in layer1-4 then runs twice per batch and would update its saved statistics twice.
+    Its momentum is therefore lowered from 0.1 to 1 - sqrt(0.9) = 0.0513: two updates with the same batch
+    = one update with 0.1 (tested: same running means). In eval mode checkpointing is off.
+
     Args:
-        timm_name (str): e.g. "resnet18.a1_in1k" (weights downloaded once into data/weights).
+        timm_name (str): e.g. "resnet18.a1_in1k" (weights downloaded once into data/weights); a ResNet.
         n_classes (int): number of labels of the second output, e.g. 11 (good + 10 defect types).
+        grad_checkpointing (bool): True = save GPU memory while training (about 20% slower).
 
     Returns (forward):
         torch.Tensor: logits of shape (n, 1 + n_classes): column 0 = defective (sigmoid -> P(defective)),
             columns 1.. = the labels (softmax -> P(label)).
     """
 
-    def __init__(self, timm_name: str, n_classes: int):
+    def __init__(self, timm_name: str, n_classes: int, grad_checkpointing: bool = False):
         super().__init__()
         self.backbone = timm.create_model(timm_name, pretrained=True, num_classes=0)  # -> pooled features
         self.defect_head = torch.nn.Linear(self.backbone.num_features, 1)
@@ -2270,6 +2280,18 @@ class TwoHeadCNN(torch.nn.Module):
         config = self.backbone.pretrained_cfg
         self.register_buffer("mean", torch.tensor(config["mean"]).view(1, 3, 1, 1))
         self.register_buffer("std", torch.tensor(config["std"]).view(1, 3, 1, 1))
+        self.grad_checkpointing = grad_checkpointing
+        if grad_checkpointing:
+            for layer in (self.backbone.layer1, self.backbone.layer2, self.backbone.layer3, self.backbone.layer4):
+                for module in layer.modules():
+                    if isinstance(module, torch.nn.BatchNorm2d):
+                        module.momentum = 1 - (1 - module.momentum) ** 0.5
+
+    def train(self, mode: bool = True) -> "TwoHeadCNN":
+        """Switch training (True) or eval mode (False); gradient checkpointing, if chosen, is on only while training."""
+        super().train(mode)
+        self.backbone.set_grad_checkpointing(mode and self.grad_checkpointing)
+        return self
 
     def prepare(self, pictures: torch.Tensor) -> torch.Tensor:
         """Turn uint8 RGB pictures (n, h, w, 3) on the model's device into the normalised input (n, 3, h, w)."""
@@ -2383,7 +2405,7 @@ def cnn_predict(model: TwoHeadCNN, paths: list[Path], desc: str) -> np.ndarray:
 
 
 def train_cnn(timm_name: str, info: pd.DataFrame, paths: pd.Series, run: int, classes: list[str],
-              checkpoint_dir: Path, resume: bool) -> dict:
+              checkpoint_dir: Path, resume: bool, grad_checkpointing: bool = False) -> dict:
     """Fine-tune a two-output CNN on the whole pictures of one run, then score the images the run uses.
 
     Training pictures: all labels of the two training folds (good and defective); validation pictures:
@@ -2403,6 +2425,7 @@ def train_cnn(timm_name: str, info: pd.DataFrame, paths: pd.Series, run: int, cl
         checkpoint_dir (Path): folder of last.pt and best.pt, e.g. CNN_DIR / "resnet18_whole_run1_<KEY>".
         resume (bool): True = continue after the last finished epoch if last.pt exists (e.g.
             USE_SAVED_RESULTS); False = train from the start and replace the checkpoints.
+        grad_checkpointing (bool): True = save GPU memory, as in TwoHeadCNN (e.g. for ResNet-50).
 
     Returns:
         dict: "history" (pd.DataFrame, one row per epoch: epoch, train_loss, val_loss, lr), "best_epoch"
@@ -2422,7 +2445,7 @@ def train_cnn(timm_name: str, info: pd.DataFrame, paths: pd.Series, run: int, cl
     class_weights = torch.tensor(counts.sum() / (len(classes) * counts), dtype=torch.float32, device=DEVICE)
 
     torch.manual_seed(SEED + run)
-    model = TwoHeadCNN(timm_name, len(classes)).to(DEVICE)
+    model = TwoHeadCNN(timm_name, len(classes), grad_checkpointing).to(DEVICE)
     optimizer = torch.optim.AdamW(model.parameters(), lr=CNN_LR, weight_decay=CNN_WEIGHT_DECAY)
     updates_per_epoch = int(np.ceil(np.ceil(train.sum() / CNN_BATCH) / CNN_ACCUMULATE))
     total_updates = CNN_EPOCHS * updates_per_epoch
@@ -3926,9 +3949,13 @@ plt.show()
 #   training curves are longer.
 # - **Evaluation** as for every method: P(defective) -> percentile among the good validation pictures,
 #   flagged above 95 (T1); the most likely label (T2).
+# - **ResNet-50** is trained exactly the same way. It does not fit batch 8 into the 4 GB GPU, so it
+#   recomputes its intermediate results in the backward pass instead of storing them (gradient
+#   checkpointing): same gradients, 2.8 GB instead of > 4 GB, about 20% slower.
 #
-# About 1.7 min per epoch on the GTX 1650: at most ~35 min per run. A checkpoint is saved
-# after every epoch (data/cnn, ~180 MB per run), so after an interruption Run All continues where it stopped.
+# About 1.7 min per epoch for ResNet-18 and ~6 min for ResNet-50 on the GTX 1650. A checkpoint is saved
+# after every epoch (data/cnn: ~180 MB per ResNet-18 run, ~380 MB per ResNet-50 run), so after an
+# interruption Run All continues where it stopped.
 #
 # Result: the kept epochs, the training curves, the T1 table and evaluation figure, the T2 table and
 # confusion matrix, Grad-CAM maps, and the best method of every family.
@@ -3941,7 +3968,8 @@ for name, timm_name in CNN_BACKBONES.items():
         cnn_runs[(name, run)] = load_or_compute(
             CACHE_DIR / f"cnn_{name}_whole_run{run}_{data['KEY']}.pkl",
             lambda: train_cnn(timm_name, eval_info, image_paths, run, t2_classes,
-                              CNN_DIR / f"{name}_whole_run{run}_{data['KEY']}", resume=USE_SAVED_RESULTS),
+                              CNN_DIR / f"{name}_whole_run{run}_{data['KEY']}", resume=USE_SAVED_RESULTS,
+                              grad_checkpointing=name in CNN_GRAD_CHECKPOINTING),
             USE_SAVED_RESULTS)
 pd.DataFrame({f"{name} run {run}": {"epochs trained": len(r["history"]),
                                     "kept epoch": r["best_epoch"],
