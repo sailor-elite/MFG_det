@@ -310,6 +310,9 @@ CNN_ACCUMULATE = 8   # batches per weight update: effective batch of 64 images
 CNN_LR = 3e-4        # AdamW learning rate: rises during the first epoch, then falls to 0 (cosine)
 CNN_WEIGHT_DECAY = 0.01
 CNN_DIR = Path("/home/qq/mfg_qc/data/cnn")  # checkpoints (git-ignored); training resumes after every epoch
+CNN_TILE_BACKBONES = ["resnet18"]  # design B (12 native tiles, "any tile defective"): networks from CNN_BACKBONES
+CNN_SCORE_PICTURES = 4  # design B: pictures per GPU batch when all their tiles are scored (4 x 12 = 48 tiles)
+FLAG_COLOUR = "#e34948"  # frame of a flagged tile in the design-B figures
 
 data = {}
 
@@ -2408,9 +2411,91 @@ def cnn_predict(model: TwoHeadCNN, paths: list[Path], desc: str) -> np.ndarray:
     return torch.cat(parts).numpy()
 
 
+class PictureTiles(Dataset):
+    """The 12 native tiles of every picture (not augmented), for finding the key tiles and for scoring (design B).
+
+    Args:
+        paths (list[Path]): image files, e.g. the 1,734 training pictures of run 1.
+
+    Returns (per item):
+        torch.Tensor: uint8 RGB tiles of shape (12, 384, 384, 3), in tile_idx order.
+    """
+
+    def __init__(self, paths: list[Path]):
+        self.paths = paths
+
+    def __len__(self) -> int:
+        return len(self.paths)
+
+    def __getitem__(self, i: int) -> torch.Tensor:
+        return torch.from_numpy(cut_tiles(load_roi(self.paths[i], ROI), CROP_SIZE))
+
+
+class KeyTiles(Dataset):
+    """One tile per picture, its key tile, with the picture's targets, randomly augmented (design B training).
+
+    Args:
+        paths (list[Path]): image files, e.g. the 1,734 training pictures of run 1.
+        key_tiles (np.ndarray): tile_idx (0-11) of every picture's key tile, shape (n,).
+        targets (np.ndarray): int array of shape (n, 2), as in WholePictures.
+
+    Returns (per item):
+        tuple[torch.Tensor, torch.Tensor]: the tile (384, 384, 3) uint8 in one of its 8 versions
+            (AUG_TILE, picked at random) and the picture's targets (2,).
+    """
+
+    def __init__(self, paths: list[Path], key_tiles: np.ndarray, targets: np.ndarray):
+        self.paths, self.key_tiles, self.targets = paths, key_tiles, targets
+
+    def __len__(self) -> int:
+        return len(self.paths)
+
+    def __getitem__(self, i: int) -> tuple[torch.Tensor, torch.Tensor]:
+        tile = cut_tiles(load_roi(self.paths[i], ROI), CROP_SIZE)[self.key_tiles[i]]
+        k_rot, flip = AUG_TILE[int(torch.randint(len(AUG_TILE), (1,)))]  # seeded like WholePictures
+        return torch.from_numpy(augment(tile, k_rot, flip)), torch.from_numpy(self.targets[i])
+
+
+def cnn_tile_logits(model: TwoHeadCNN, paths: list[Path], progress: tqdm) -> torch.Tensor:
+    """Return the CNN's raw outputs for all 12 tiles of every picture (eval mode, no gradients, no augmentation).
+
+    Args:
+        model (TwoHeadCNN): the network on DEVICE.
+        paths (list[Path]): image files, e.g. the 875 validation pictures of run 1.
+        progress (tqdm): progress bar, advanced by the number of pictures.
+
+    Returns:
+        torch.Tensor: float tensor on the CPU of shape (n_pictures, 12, 1 + n_classes): logits per tile
+            (column 0 = defective, then the labels), e.g. (875, 12, 12). The key tile of a picture is the
+            one with the highest column 0.
+    """
+    loader = DataLoader(PictureTiles(paths), batch_size=CNN_SCORE_PICTURES, num_workers=DATA_WORKERS)
+    model.eval()
+    parts = []
+    with torch.inference_mode():
+        for tiles in loader:  # (b, 12, 384, 384, 3)
+            logits = model(model.prepare(tiles.flatten(0, 1).to(DEVICE)))  # (b * 12, 1 + n_classes)
+            parts.append(logits.view(len(tiles), -1, logits.shape[1]).cpu())
+            progress.update(len(tiles))
+    return torch.cat(parts)
+
+
+def key_tile_outputs(tile_logits: torch.Tensor) -> torch.Tensor:
+    """Return every picture's outputs = those of its key tile (the tile with the highest "defective" logit).
+
+    Args:
+        tile_logits (torch.Tensor): from cnn_tile_logits, shape (n, 12, 1 + n_classes).
+
+    Returns:
+        torch.Tensor: shape (n, 1 + n_classes). Example: tile logits 0 of one picture [-3.1, ..., 2.4 (tile 7),
+            ...] -> its row is tile 7's logits, so P(defective) = sigmoid(2.4) = 0.92, the highest of its tiles.
+    """
+    return tile_logits[torch.arange(len(tile_logits)), tile_logits[:, :, 0].argmax(dim=1)]
+
+
 def train_cnn(timm_name: str, info: pd.DataFrame, paths: pd.Series, run: int, classes: list[str],
-              checkpoint_dir: Path, resume: bool, grad_checkpointing: bool = False) -> dict:
-    """Fine-tune a two-output CNN on the whole pictures of one run, then score the images the run uses.
+              checkpoint_dir: Path, resume: bool, grad_checkpointing: bool = False, design: str = "whole") -> dict:
+    """Fine-tune a two-output CNN on the pictures of one run (design A or B), then score the images the run uses.
 
     Training pictures: all labels of the two training folds (good and defective); validation pictures:
     the validation fold. After every epoch the validation loss is computed and two checkpoints are saved
@@ -2419,6 +2504,14 @@ def train_cnn(timm_name: str, info: pd.DataFrame, paths: pd.Series, run: int, cl
     best epoch is CNN_PATIENCE epochs back, e.g. best epoch 6 -> stop after epoch 11 (also when resuming).
     At the end, best.pt scores the test, validation and test-only images. The random seed is fixed
     (SEED + run); cuDNN on the GPU may still make two trainings differ slightly.
+
+    Design "whole" (A): the network sees the whole picture (WHOLE_SIZE). Design "tiles" (B): the network
+    sees single native tiles, and a picture's outputs are those of its key tile, the tile with the highest
+    "defective" output (so P(defective) of the picture = the highest of its 12 tiles). Every epoch of B:
+    (1) score all 12 tiles of every training picture (eval mode, no gradients) to find the key tiles;
+    (2) train on the key tiles with their pictures' targets (one tile per picture, randomly rotated or
+    flipped); (3) validation loss = the loss of the validation pictures' key tiles. Only the picture's
+    label is used: in a corner picture, only the tile the network finds most defective learns "corner".
 
     Args:
         timm_name (str): e.g. "resnet18.a1_in1k".
@@ -2430,12 +2523,19 @@ def train_cnn(timm_name: str, info: pd.DataFrame, paths: pd.Series, run: int, cl
         resume (bool): True = continue after the last finished epoch if last.pt exists (e.g.
             USE_SAVED_RESULTS); False = train from the start and replace the checkpoints.
         grad_checkpointing (bool): True = save GPU memory, as in TwoHeadCNN (e.g. for ResNet-50).
+        design (str): "whole" (design A) or "tiles" (design B).
 
     Returns:
         dict: "history" (pd.DataFrame, one row per epoch: epoch, train_loss, val_loss, lr), "best_epoch"
             (int, from 1), "scores" (pd.DataFrame, index = file of the test, validation and test-only
-            images; column "p_defect" = P(defective), and one column per label with P(label)).
+            images; column "p_defect" = P(defective), and one column per label with P(label)); design B
+            also "tile_scores" (pd.DataFrame, same index, columns 0-11 = tile_idx: P(defective) of every tile).
+
+    Raises:
+        ValueError: if design is not "whole" or "tiles".
     """
+    if design not in ("whole", "tiles"):
+        raise ValueError(f"design must be 'whole' or 'tiles', got {design}")
     roles = run_roles(info["fold"], run)
     label_index = info["label"].map({c: i for i, c in enumerate(classes)}).fillna(-1).astype(int)
     targets = np.stack([info["is_defect"].astype(int).to_numpy(), label_index.to_numpy()], axis=1)
@@ -2468,19 +2568,30 @@ def train_cnn(timm_name: str, info: pd.DataFrame, paths: pd.Series, run: int, cl
         history, best_loss, best_epoch = state["history"], state["best_loss"], state["best_epoch"]
         print(f"Resumed after epoch {len(history)} of {CNN_EPOCHS}: {last_file}")
 
-    per_epoch = int(train.sum() + val.sum())
+    # Pictures per epoch for the progress bar; design B reads every training picture twice (key tiles, training)
+    per_epoch = int(train.sum() + val.sum()) + (int(train.sum()) if design == "tiles" else 0)
     progress = tqdm(total=CNN_EPOCHS * per_epoch, initial=len(history) * per_epoch,
-                    desc=f"{timm_name.split('.')[0]} run {run}", unit="image")
+                    desc=f"{timm_name.split('.')[0]} {design} run {run}", unit="image")
     for epoch in range(len(history), CNN_EPOCHS):
         if epoch - best_epoch >= CNN_PATIENCE:  # no lower validation loss for CNN_PATIENCE epochs: stop
             break
         done = f" | last val loss {history[-1]['val_loss']:.3f}, best {best_loss:.3f} (epoch {best_epoch})" if history else ""
         progress.set_postfix_str(f"epoch {epoch + 1} of {CNN_EPOCHS}{done}")
-        train_loss = cnn_epoch(model, cnn_loader(list(all_paths[train]), targets[train], train=True,
-                                                 seed=SEED + 100 * run + epoch),
-                               pos_weight, class_weights, progress, optimizer, scheduler)
-        val_loss = cnn_epoch(model, cnn_loader(list(all_paths[val]), targets[val], train=False),
-                             pos_weight, class_weights, progress)
+        if design == "whole":
+            train_loss = cnn_epoch(model, cnn_loader(list(all_paths[train]), targets[train], train=True,
+                                                     seed=SEED + 100 * run + epoch),
+                                   pos_weight, class_weights, progress, optimizer, scheduler)
+            val_loss = cnn_epoch(model, cnn_loader(list(all_paths[val]), targets[val], train=False),
+                                 pos_weight, class_weights, progress)
+        else:
+            key_tiles = cnn_tile_logits(model, list(all_paths[train]), progress)[:, :, 0].argmax(dim=1).numpy()
+            key_loader = DataLoader(KeyTiles(list(all_paths[train]), key_tiles, targets[train]), batch_size=CNN_BATCH,
+                                    shuffle=True, num_workers=DATA_WORKERS,
+                                    generator=torch.Generator().manual_seed(SEED + 100 * run + epoch))
+            train_loss = cnn_epoch(model, key_loader, pos_weight, class_weights, progress, optimizer, scheduler)
+            val_outputs = key_tile_outputs(cnn_tile_logits(model, list(all_paths[val]), progress))
+            val_loss = cnn_loss(val_outputs.to(DEVICE), torch.from_numpy(targets[val]).to(DEVICE),
+                                pos_weight, class_weights).item()
         history.append({"epoch": epoch + 1, "train_loss": train_loss, "val_loss": val_loss,
                         "lr": float(optimizer.param_groups[0]["lr"])})
         if val_loss < best_loss:
@@ -2499,11 +2610,19 @@ def train_cnn(timm_name: str, info: pd.DataFrame, paths: pd.Series, run: int, cl
 
     model.load_state_dict(torch.load(best_file, map_location=DEVICE))
     scored = (roles != "train").to_numpy()
-    probabilities = cnn_predict(model, list(all_paths[scored]), f"run {run}: scoring")
+    result = {"history": pd.DataFrame(history), "best_epoch": best_epoch}
+    if design == "whole":
+        probabilities = cnn_predict(model, list(all_paths[scored]), f"run {run}: scoring")
+    else:
+        with tqdm(total=int(scored.sum()), desc=f"run {run}: scoring", unit="image") as scoring:
+            tile_logits = cnn_tile_logits(model, list(all_paths[scored]), scoring)
+        key = key_tile_outputs(tile_logits)
+        probabilities = torch.cat([torch.sigmoid(key[:, :1]), torch.softmax(key[:, 1:], dim=1)], dim=1).numpy()
+        result["tile_scores"] = pd.DataFrame(torch.sigmoid(tile_logits[:, :, 0]).numpy(), index=info.index[scored])
     del model, optimizer
     torch.cuda.empty_cache()
-    return {"history": pd.DataFrame(history), "best_epoch": best_epoch,
-            "scores": pd.DataFrame(probabilities, index=info.index[scored], columns=["p_defect"] + classes)}
+    result["scores"] = pd.DataFrame(probabilities, index=info.index[scored], columns=["p_defect"] + classes)
+    return result
 
 
 def cnn_gradcam(model: TwoHeadCNN, path: Path, output: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -2530,6 +2649,62 @@ def cnn_gradcam(model: TwoHeadCNN, path: Path, output: int) -> tuple[np.ndarray,
         logits = model(x)[0]
     probabilities = torch.cat([torch.sigmoid(logits[:1]), torch.softmax(logits[1:], dim=0)]).cpu().numpy()
     return picture, heat, probabilities
+
+
+def cnn_tile_gradcam(model: TwoHeadCNN, path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Return a picture, its Grad-CAM map put together from its 12 tiles (design B), and the CNN's outputs.
+
+    Every tile gets its own Grad-CAM map of the "defective" output (scaled 0-1 within the tile by Grad-CAM),
+    weighted by the tile's P(defective); the 12 maps are put side by side and scaled to 0-1 within the
+    picture. So a tile with P = 0.05 stays almost white, and the darkest spot lies in the most defective tile.
+
+    Args:
+        model (TwoHeadCNN): the trained network on DEVICE (a ResNet: it has backbone.layer4).
+        path (Path): image file.
+
+    Returns:
+        tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]: the picture shrunk to WHOLE_SIZE (576, 768, 3)
+            uint8, the map (576, 768) float 0-1, P(defective) of the 12 tiles (12,), and the picture's
+            probabilities (1 + n_classes,) as in train_cnn (those of its key tile).
+    """
+    roi_img = load_roi(path, ROI)
+    x = model.prepare(torch.from_numpy(cut_tiles(roi_img, CROP_SIZE)).to(DEVICE))  # (12, 3, 384, 384)
+    model.eval()
+    with torch.inference_mode():
+        logits = model(x).cpu()
+    tile_p = torch.sigmoid(logits[:, 0]).numpy()
+    key = logits[int(logits[:, 0].argmax())]
+    probabilities = torch.cat([torch.sigmoid(key[:1]), torch.softmax(key[1:], dim=0)]).numpy()
+    with GradCAM(model=model, target_layers=[model.backbone.layer4[-1]]) as cam:
+        maps = [cam(input_tensor=x[i:i + 1], targets=[ClassifierOutputTarget(0)])[0] * tile_p[i] for i in range(len(x))]
+    n_cols = (ROI[2] - ROI[0]) // CROP_SIZE  # 4 tiles per row
+    stitched = np.block([maps[r * n_cols:(r + 1) * n_cols] for r in range(len(maps) // n_cols)])  # (1152, 1536)
+    heat = cv2.resize(stitched / max(stitched.max(), 1e-7), WHOLE_SIZE, interpolation=cv2.INTER_AREA)
+    return shrink_roi(roi_img, WHOLE_SIZE), heat, tile_p, probabilities
+
+
+def tile_flags(tile_scores: pd.DataFrame, picture_scores: pd.Series, info: pd.DataFrame, run: int) -> pd.DataFrame:
+    """Return which tiles are flagged in one run (design B): those above the run's picture cut.
+
+    The cut is the same as for the pictures: a tile is flagged if its P(defective) is above the 95th
+    percentile of the good validation pictures' scores (unusualness > FLAG_PERCENTILE). A picture's score is
+    its highest tile score, so a picture is flagged exactly when at least one of its tiles is flagged.
+    Example: cut 0.62; tile scores 0.95, 0.90, 0.70 and nine below 0.1 -> 3 flagged tiles.
+
+    Args:
+        tile_scores (pd.DataFrame): index = file, columns 0-11 (tile_idx), P(defective) of every tile in this run.
+        picture_scores (pd.Series): index = file, the pictures' P(defective) in this run (for the cut).
+        info (pd.DataFrame): index = file (images that are not excluded), columns fold, label.
+        run (int): the run, 1-4.
+
+    Returns:
+        pd.DataFrame: bool, same shape as tile_scores: True = flagged tile.
+    """
+    roles = run_roles(info["fold"], run)
+    s = picture_scores.reindex(info.index)
+    good_val = s[(roles == "validation") & (info["label"] == "good")]
+    return tile_scores.apply(lambda column: pd.Series(
+        unusualness(column, good_val, two_sided=False) > FLAG_PERCENTILE, index=column.index))
 
 
 def plot_training_curves(runs: dict[int, dict], title: str) -> plt.Figure:
@@ -2560,13 +2735,17 @@ def plot_training_curves(runs: dict[int, dict], title: str) -> plt.Figure:
     return fig
 
 
-def plot_gradcam(examples: list[dict], title: str) -> plt.Figure:
+def plot_gradcam(examples: list[dict], title: str,
+                 map_label: str = "Grad-CAM of the \"defective\" output (0-1 within the picture)") -> plt.Figure:
     """Draw whole pictures next to their Grad-CAM maps, two examples per row.
 
     Args:
         examples (list[dict]): one dict per picture with label, file, run, picture (576, 768, 3),
             map (576, 768) 0-1, p_defect (float), predicted (str, most likely label), flagged (bool).
+            Design B also: tile_p (12 floats, P(defective) per tile) and tile_flagged (12 bools): the
+            picture then shows its 4 x 3 tiles with their P(defective), flagged tiles framed in FLAG_COLOUR.
         title (str): figure title.
+        map_label (str): label of the colour bar.
 
     Returns:
         plt.Figure: per example the picture (title: label, file, run, decision) and its map (title:
@@ -2581,9 +2760,19 @@ def plot_gradcam(examples: list[dict], title: str) -> plt.Figure:
         ax_img.imshow(ex["picture"])
         decision = "flagged" if ex["flagged"] else "passed"
         ax_img.set_title(f"{ex['label']}: {ex['file']} (run {ex['run']}), {decision}", fontsize=10)
+        if "tile_p" in ex:  # design B: tile grid with P(defective); flagged tiles drawn last, on top
+            size = ex["picture"].shape[0] / 3  # tile side in the shown picture: 576 / 3 = 192 px
+            for t in sorted(range(len(ex["tile_p"])), key=lambda t: ex["tile_flagged"][t]):
+                r, c = divmod(t, 4)
+                flagged_tile = ex["tile_flagged"][t]
+                ax_img.add_patch(Rectangle((c * size, r * size), size, size, fill=False,
+                                           edgecolor=FLAG_COLOUR if flagged_tile else "white",
+                                           lw=3 if flagged_tile else 0.8))
+                ax_img.text(c * size + 8, r * size + 8, f"{ex['tile_p'][t]:.2f}", color="white", fontsize=8,
+                            va="top", bbox=dict(facecolor="black", alpha=0.5, pad=1, lw=0))
         image = ax_map.imshow(ex["map"], cmap="Blues", vmin=0, vmax=1)
         ax_map.set_title(f"P(defective) {ex['p_defect']:.2f}, predicted label: {ex['predicted']}", fontsize=10)
-    fig.colorbar(image, ax=axes, shrink=0.5, label="Grad-CAM of the \"defective\" output (0-1 within the picture)")
+    fig.colorbar(image, ax=axes, shrink=0.5, label=map_label)
     fig.suptitle(title, fontsize=13)
     return fig
 
@@ -4077,6 +4266,164 @@ pd.concat([
 ]).set_index("family")[["method", "auroc", "balanced_accuracy", "har", "false_alarms_pct"] + eval_labels[1:]].round(2)
 
 # %% [markdown]
+# ## Design B: 12 tiles, "any tile defective"
+#
+# Input: the 12 tiles of the ROI (4 x 3 tiles of 384 px) at **full resolution** (design A: half). The
+# network gives every tile its own P(defective); **a picture's P(defective) is the highest of its 12 tiles**,
+# so a picture is defective if any tile is, and the tile scores show which tiles are defective. Only the
+# picture's label is used (multiple instance learning: a picture is a bag of tiles); a corner picture does
+# not teach "corner" to its 11 normal tiles.
+# - **One epoch** (run 1): (1) score all 12 tiles of the 1,734 training pictures (20,808 tiles, no training)
+#   and take each picture's **key tile**, the one with the highest P(defective); (2) train on the 1,734 key
+#   tiles with their pictures' labels, everything else as in design A (random rotation or flip: 8 versions
+#   of a square tile; class weights; updates of 64; learning rate; early stopping, kept epoch). Example: in a
+#   corner picture the tile with the coverslip edge scores highest and learns "corner"; in a dense good
+#   picture its most defect-like tile learns "good". (3) Validation loss: the key tiles of the 875
+#   validation pictures (all 12 tiles scored). Same scheme as Campanella et al. (2019) for pathology slides.
+# - **Outputs**: P(defective) of the picture (highest tile) -> the common evaluation (T1); the label of the
+#   key tile (T2); P(defective) of all 12 tiles. A tile is **flagged** if its P(defective) is above the
+#   picture cut of the run, so a picture is flagged exactly when at least one of its tiles is.
+# - Networks in `CNN_TILE_BACKBONES` (ResNet-18 first); ResNet-50 with gradient checkpointing as in design A.
+#
+# About 3.5 min per epoch for ResNet-18 and ~9 min for ResNet-50 on the GTX 1650.
+#
+# Result: the kept epochs, training curves, the T1 table of all CNNs (designs A and B) and the evaluation
+# figure, the T2 table and confusion matrix, the number of flagged tiles per label, and the pictures with
+# their tile scores and Grad-CAM maps.
+
+# %%
+# Train (or load) every CNN in CNN_TILE_BACKBONES on tiles (design B) in all 4 runs; each run is saved when done
+cnn_tile_runs = {}  # (backbone, run) -> {"history", "best_epoch", "scores", "tile_scores"}
+for name in CNN_TILE_BACKBONES:
+    timm_name = CNN_BACKBONES[name]
+    for run in FOLDS:
+        cnn_tile_runs[(name, run)] = load_or_compute(
+            CACHE_DIR / f"cnn_{name}_tiles_run{run}_{data['KEY']}.pkl",
+            lambda: train_cnn(timm_name, eval_info, image_paths, run, t2_classes,
+                              CNN_DIR / f"{name}_tiles_run{run}_{data['KEY']}", resume=USE_SAVED_RESULTS,
+                              grad_checkpointing=name in CNN_GRAD_CHECKPOINTING, design="tiles"),
+            USE_SAVED_RESULTS)
+pd.DataFrame({f"{name} run {run}": {"epochs trained": len(r["history"]),
+                                    "kept epoch": r["best_epoch"],
+                                    "validation loss": round(r["history"]["val_loss"].min(), 3),
+                                    "training loss then": round(r["history"].loc[r["best_epoch"] - 1, "train_loss"], 3),
+                                    "images scored": len(r["scores"])}
+              for (name, run), r in cnn_tile_runs.items()})
+
+# %%
+# Training curves of design B (training loss: on the key tiles; validation loss: key tiles of the validation pictures)
+for name in CNN_TILE_BACKBONES:
+    fig = plot_training_curves({run: cnn_tile_runs[(name, run)] for run in FOLDS}, f"CNN {name}, 12 tiles")
+    save_figure(fig, RESULTS_DIR / f"cnn_{name}_tiles_training.png", OVERWRITE)
+    plt.show()
+
+# %%
+# T1 (good vs defective): picture P(defective) = highest tile; all CNNs (designs A and B) in one table
+cnn_tile_results = {}  # method name -> (metrics per run, predictions)
+for name in CNN_TILE_BACKBONES:
+    image_scores = pd.DataFrame({run: cnn_tile_runs[(name, run)]["scores"]["p_defect"] for run in FOLDS})
+    cnn_tile_results[f"CNN {name} | tiles"] = evaluate_method(image_scores, eval_info, two_sided=False)
+data["CNN_ALL"] = pd.DataFrame([
+    {"family": "CNN", **summary_row(method, *result, eval_labels)}
+    for method, result in {**cnn_results, **cnn_tile_results}.items()
+])
+save_table(data["CNN_ALL"].round(4), RESULTS_DIR / "cnn_all_summary.csv", OVERWRITE)
+data["CNN_ALL"].set_index("method")[
+    ["auroc", "auroc_sd", "balanced_accuracy", "har", "false_alarms_pct", "false_alarms_sd_pct"] + eval_labels[1:]
+].round(2)
+
+# %%
+# Full evaluation figure of every design-B CNN
+for method, result in cnn_tile_results.items():
+    fig = plot_evaluation(*result, eval_labels, method)
+    file_name = method.lower().replace("cnn ", "cnn_").replace(" | ", "_")  # "CNN resnet18 | tiles" -> cnn_resnet18_tiles
+    save_figure(fig, RESULTS_DIR / f"{file_name}.png", OVERWRITE)
+    plt.show()
+
+# %%
+# T2 (defect type): the label of the key tile; all CNNs (designs A and B) in one table
+cnn_tile_t2_results = {
+    f"CNN {name} | tiles": evaluate_multiclass(
+        {run: cnn_tile_runs[(name, run)]["scores"][t2_classes] for run in FOLDS}, eval_info, t2_classes)
+    for name in CNN_TILE_BACKBONES
+}
+cnn_all_t2_results = {**cnn_t2_results, **cnn_tile_t2_results}
+data["CNN_ALL_DEFECT_TYPE"] = pd.DataFrame([
+    {"method": method,
+     **{m: metrics[m].mean() for m in ["accuracy", "mean_recall", "har", "group_accuracy"]},
+     "mean_recall_sd": metrics["mean_recall"].std()}
+    for method, (metrics, _) in cnn_all_t2_results.items()
+])
+save_table(data["CNN_ALL_DEFECT_TYPE"].round(4), RESULTS_DIR / "cnn_all_defect_type_summary.csv", OVERWRITE)
+data["CNN_ALL_DEFECT_TYPE"].round(3)
+
+# %%
+# Confusion matrix of the best CNN of both designs (highest mean recall over the 11 labels), and its recall per label
+best_cnn_all_t2 = data["CNN_ALL_DEFECT_TYPE"].sort_values("mean_recall", ascending=False)["method"].iloc[0]
+fig = plot_confusion_matrix(cnn_all_t2_results[best_cnn_all_t2][1], t2_classes, TEST_ONLY_LABELS,
+                            f"Defect type, {best_cnn_all_t2}")
+save_figure(fig, RESULTS_DIR / "cnn_all_defect_type_confusion.png", OVERWRITE)
+plt.show()
+best_cnn_all_t2_metrics = cnn_all_t2_results[best_cnn_all_t2][0]
+pd.DataFrame({
+    "recall_pct_mean": 100 * best_cnn_all_t2_metrics[[f"recall_{c}" for c in t2_classes]].mean().to_numpy(),
+    "recall_pct_sd": 100 * best_cnn_all_t2_metrics[[f"recall_{c}" for c in t2_classes]].std().to_numpy(),
+}, index=t2_classes).round(1)
+
+# %%
+# Which tiles are flagged? For every flagged test (and test-only) picture: how many of its 12 tiles are
+# above the cut. Defects of the whole field (blur, filter, dilution) should flag many tiles; bubbles and
+# corners only a few.
+flagged_tile_tables = {}
+for name in CNN_TILE_BACKBONES:
+    predictions = cnn_tile_results[f"CNN {name} | tiles"][1]
+    counts = []
+    for run in FOLDS:
+        result = cnn_tile_runs[(name, run)]
+        flags = tile_flags(result["tile_scores"], result["scores"]["p_defect"], eval_info, run)
+        flagged = predictions[(predictions["run"] == run) & predictions["flagged"]]
+        counts.append(pd.DataFrame({"label": flagged["label"].to_numpy(),
+                                    "tiles": flags.loc[flagged["file"]].sum(axis=1).to_numpy()}))
+    counts = pd.concat(counts)
+    print(f"{name}: every flagged picture has at least one flagged tile: {bool((counts['tiles'] >= 1).all())}")
+    flagged_tile_tables[name] = counts.groupby("label")["tiles"].agg(
+        flagged_pictures="size", mean_flagged_tiles="mean",
+        pct_1_to_3_tiles=lambda t: 100 * (t <= 3).mean(), pct_all_12_tiles=lambda t: 100 * (t == 12).mean(),
+    ).reindex(eval_labels)
+data["CNN_FLAGGED_TILES"] = pd.concat(flagged_tile_tables, names=["network", "label"]).round(1)
+save_table(data["CNN_FLAGGED_TILES"].reset_index(), RESULTS_DIR / "cnn_tiles_flagged_tiles.csv", OVERWRITE)
+data["CNN_FLAGGED_TILES"]
+
+# %%
+# The same random pictures as in the design-A Grad-CAM figure: each with its 12 tile scores (red frame =
+# flagged tile) and a Grad-CAM map put together from the tiles, each tile's map weighted by its P(defective)
+for name in CNN_TILE_BACKBONES:
+    predictions = cnn_tile_results[f"CNN {name} | tiles"][1].set_index(["run", "file"])
+    model = TwoHeadCNN(CNN_BACKBONES[name], len(t2_classes)).to(DEVICE)
+    rng = np.random.default_rng(SEED)
+    examples = []
+    for label in eval_labels:
+        files = sorted(eval_info.index[eval_info["label"] == label])
+        file = files[rng.integers(len(files))]
+        fold = eval_info.loc[file, "fold"]
+        run = 1 if pd.isna(fold) else int(fold)
+        result = cnn_tile_runs[(name, run)]
+        model.load_state_dict(torch.load(CNN_DIR / f"{name}_tiles_run{run}_{data['KEY']}" / "best.pt",
+                                         map_location=DEVICE))
+        picture, heat, tile_p, probabilities = cnn_tile_gradcam(model, Path(image_paths[file]))
+        flags = tile_flags(result["tile_scores"], result["scores"]["p_defect"], eval_info, run).loc[file]
+        examples.append({"label": label, "file": file, "run": run, "picture": picture, "map": heat,
+                         "p_defect": probabilities[0], "predicted": t2_classes[int(np.argmax(probabilities[1:]))],
+                         "flagged": bool(predictions.loc[(run, file), "flagged"]),
+                         "tile_p": tile_p, "tile_flagged": flags.to_numpy()})
+    del model
+    torch.cuda.empty_cache()
+    fig = plot_gradcam(examples, f"CNN {name}, 12 tiles: P(defective) per tile (red frame = flagged) and Grad-CAM",
+                       map_label="Grad-CAM of each tile x its P(defective) (0-1 within the picture)")
+    save_figure(fig, RESULTS_DIR / f"cnn_gradcam_{name}_tiles.png", OVERWRITE)
+    plt.show()
+
+# %% [markdown]
 # # Benchmark
 #
 # One table of all methods, chosen and ranked by **balanced accuracy**: the mean of the detection rate on
@@ -4086,7 +4433,8 @@ pd.concat([
 # Example: ResNet-50 has the higher AUROC (0.96 vs 0.95), ResNet-18 the higher balanced accuracy (0.90 vs
 # 0.86, with fewer false alarms and more bubbles, undiluted and frozen milk caught).
 # - **Best of each family**: the method with the highest balanced accuracy in each of the 6 families
-#   (handcrafted one-class, handcrafted supervised, deep one-class, deep supervised, anomaly detection, CNN).
+#   (handcrafted one-class, handcrafted supervised, deep one-class, deep supervised, anomaly detection, CNN
+#   with both designs: whole picture and 12 tiles).
 # - **Votes of the best** (`BENCHMARK_VOTES`): the n family bests with the highest balanced accuracy each
 #   decide on their own (unusualness > 95); an image is flagged if at least k of them flag it.
 #   "At least 1 of 6": any of the 6 is enough. "At least 2 of 3": 2 of the 3 best must agree.
@@ -4096,12 +4444,13 @@ pd.concat([
 
 # %%
 # Best method of each family by balanced accuracy, and the votes of the best of them
-for name in CNN_BACKBONES:  # CNN image scores (P(defective)), so the CNNs can vote too
-    method_scores[f"CNN {name} | whole"] = pd.DataFrame(
-        {run: cnn_runs[(name, run)]["scores"]["p_defect"] for run in FOLDS})
+for design, runs, names in [("whole", cnn_runs, CNN_BACKBONES), ("tiles", cnn_tile_runs, CNN_TILE_BACKBONES)]:
+    for name in names:  # CNN image scores (P(defective)) of both designs, so the CNNs can vote too
+        method_scores[f"CNN {name} | {design}"] = pd.DataFrame(
+            {run: runs[(name, run)]["scores"]["p_defect"] for run in FOLDS})
 families = [("handcrafted one-class", data["ONE_CLASS"]), ("handcrafted supervised", data["SUPERVISED"])] + [
     (family, table) for family, table in data["DEEP"].groupby("family")
-] + [("anomaly detection", data["ANOMALY_ALL"]), ("CNN", data["CNN"])]
+] + [("anomaly detection", data["ANOMALY_ALL"]), ("CNN", data["CNN_ALL"])]
 family_best = pd.concat([
     table.sort_values("balanced_accuracy", ascending=False).head(1).assign(family=family) for family, table in families
 ]).sort_values("balanced_accuracy", ascending=False)
