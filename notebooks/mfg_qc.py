@@ -299,6 +299,7 @@ BENCHMARK_VOTES = [(6, 1), (3, 2)]  # (n voters, k votes needed): any of the 6; 
 # the 4-slide cut and do not vote); chosen per run on non-test data
 FINAL_VOTES = [(5, 1), (3, 2)]  # (n voters, k votes needed): any of the 5; 2 of the 3 best
 BOOTSTRAP_RESAMPLES = 2000  # 95 % intervals: the preparations (slides) drawn again this many times
+TIMING_PICTURES = 50  # pictures timed one at a time (after 3 warm-up pictures), on the GPU and on the CPU
 
 # CNNs (CLAUDE.md §9 Step 5): ImageNet networks fine-tuned with two outputs, good vs defective (T1) and
 # which label (T2). Design A: the whole picture (WHOLE_SIZE). Trained in fp32: fp16 overflows in these
@@ -2583,6 +2584,85 @@ def mcnemar_test(a: pd.DataFrame, b: pd.DataFrame) -> dict:
     discordant = table[0][1] + table[1][0]
     result = mcnemar(table, exact=discordant < 25, correction=True)
     return {"only_a_right": table[0][1], "only_b_right": table[1][0], "p_value": float(result.pvalue)}
+
+
+def picture_score_dinov2(backbone: torch.nn.Module, classifier, roi_img: np.ndarray) -> float:
+    """Return P(defective) of one picture from DINOv2 whole-picture features and a fitted classifier.
+
+    Args:
+        backbone (torch.nn.Module): DINOv2 from make_backbone, on DEVICE.
+        classifier: a fitted scikit-learn classifier on the 768 DINOv2 features, e.g. logistic regression.
+        roi_img (np.ndarray): the ROI of the picture, (1152, 1536, 3) uint8, from load_roi.
+
+    Returns:
+        float: P(defective), 0-1.
+    """
+    picture = torch.from_numpy(shrink_roi(roi_img, WHOLE_SIZE)).unsqueeze(0).to(DEVICE)
+    return float(classifier.predict_proba(backbone_features(backbone, picture).cpu().numpy())[0, 1])
+
+
+def picture_tile_scores_dfm(model: DFMModel, roi_img: np.ndarray) -> np.ndarray:
+    """Return the DFM score of each of the 12 tiles of one picture (higher = less like the good tiles).
+
+    Args:
+        model (DFMModel): a fitted DFM model (fit_dfm), on DEVICE.
+        roi_img (np.ndarray): the ROI of the picture, (1152, 1536, 3) uint8.
+
+    Returns:
+        np.ndarray: shape (12,), in tile_idx order; the picture score of "tiles mean" is their mean.
+    """
+    model.eval()
+    tiles = torch.from_numpy(cut_tiles(roi_img, CROP_SIZE)).unsqueeze(0)  # (1, 12, 384, 384, 3)
+    with torch.no_grad():
+        return model(anomaly_input(tiles, model)).pred_score.reshape(-1).cpu().numpy()
+
+
+def picture_score_cnn(model: "TwoHeadCNN", roi_img: np.ndarray) -> float:
+    """Return P(defective) of one picture from a whole-picture CNN (design A).
+
+    Args:
+        model (TwoHeadCNN): the trained network, on DEVICE.
+        roi_img (np.ndarray): the ROI of the picture, (1152, 1536, 3) uint8.
+
+    Returns:
+        float: P(defective), 0-1.
+    """
+    model.eval()
+    x = model.prepare(torch.from_numpy(shrink_roi(roi_img, WHOLE_SIZE)).unsqueeze(0).to(DEVICE))
+    with torch.inference_mode():
+        return float(torch.sigmoid(model(x)[0, 0]))
+
+
+def time_per_picture(model_steps: dict, paths: list[Path], warmup: int = 3) -> pd.DataFrame:
+    """Time reading and every model step for each picture, one picture at a time (as in screening).
+
+    The first `warmup` pictures are not counted (the GPU and the libraries need a few calls to get going).
+
+    Args:
+        model_steps (dict): step name -> function(roi image) that runs the step on DEVICE, e.g.
+            lambda roi: picture_tile_scores_dfm(dfm, roi).
+        paths (list[Path]): pictures to time, e.g. 53 random A-D pictures.
+        warmup (int): pictures at the start that are not counted, e.g. 3.
+
+    Returns:
+        pd.DataFrame: one row per counted picture; columns "read picture" (reading the PNG and cutting the ROI,
+            CPU) and one per step: seconds.
+    """
+    sync = torch.cuda.synchronize if DEVICE == "cuda" else (lambda: None)
+    rows = []
+    for i, path in enumerate(tqdm(paths, desc=f"timing on {DEVICE}", unit="picture")):
+        t0 = time.perf_counter()
+        roi_img = load_roi(path, ROI)
+        row = {"read picture": time.perf_counter() - t0}
+        for name, step in model_steps.items():
+            sync()
+            t0 = time.perf_counter()
+            step(roi_img)
+            sync()
+            row[name] = time.perf_counter() - t0
+        if i >= warmup:
+            rows.append(row)
+    return pd.DataFrame(rows)
 
 
 def out_of_fold_scores(scores: pd.DataFrame, extra: dict, info: pd.DataFrame) -> pd.DataFrame:
@@ -5222,6 +5302,119 @@ ax.legend(frameon=False, loc="center left", bbox_to_anchor=(1.0, 0.5))
 ax.spines[["top", "right"]].set_visible(False)
 save_figure(fig, RESULTS_DIR / "final_blur_levels.png", OVERWRITE)
 plt.show()
+
+# %% [markdown]
+# ## Max rule: one decision per picture
+#
+# Every picture counts once: the A-D pictures with the score and decision of their test fold, the other milks
+# with the median of their 4 runs' scores (and how many runs flag them). The score is the max rule's
+# unusualness (0-100: the percentile among the good pictures of the 12 non-test slides); flagged above 95.
+# Result: a table per class, the histogram of the scores (good vs bad), and the list of all pictures (CSV).
+
+# %%
+# One max-rule score and decision per picture, and the count per class
+max_rule_predictions = final_tested["max rule"][1]
+max_rule_pictures = max_rule_predictions.groupby("file").agg(
+    label=("label", "first"), score=("unusualness", "median"), runs=("run", "size"),
+    runs_flagged=("flagged", "sum"))
+max_rule_pictures["prep"] = prep_of.reindex(max_rule_pictures.index).to_numpy()
+max_rule_pictures["group"] = np.where(max_rule_pictures["label"] == "good", "good", "bad")
+max_rule_pictures["flagged"] = max_rule_pictures["score"] > FLAG_PERCENTILE
+save_table(max_rule_pictures.reset_index(), RESULTS_DIR / "final_max_rule_per_picture.csv", OVERWRITE)
+max_rule_counts = max_rule_pictures.groupby("label").agg(pictures=("flagged", "size"), flagged=("flagged", "sum"))
+max_rule_counts = pd.concat([
+    max_rule_counts.reindex(eval_labels),
+    max_rule_pictures.groupby("group").agg(pictures=("flagged", "size"), flagged=("flagged", "sum"))
+    .reindex(["good", "bad"]).rename(index=lambda g: f"all {g}")])
+max_rule_counts["flagged %"] = (100 * max_rule_counts["flagged"] / max_rule_counts["pictures"]).round(1)
+print(f"{len(max_rule_pictures)} pictures; other milks flagged by how many of their 4 runs: "
+      f"{max_rule_pictures.loc[max_rule_pictures['runs'] == 4, 'runs_flagged'].value_counts().sort_index().to_dict()}")
+max_rule_counts
+
+# %%
+# Histogram of the max-rule score, good vs bad, one score per picture (left: all; right: zoom on 80-100)
+fig, (ax_all, ax_zoom) = plt.subplots(1, 2, figsize=(15, 5), constrained_layout=True)
+for ax, (low, width) in [(ax_all, (0, 2)), (ax_zoom, (80, 0.5))]:
+    bins = np.arange(low, 100 + width, width)
+    for group, colour, name in [("good", RUN_COLOURS[1], "good"), ("bad", RUN_COLOURS[2], "bad (9 defects + 4 other milks)")]:
+        s = max_rule_pictures.loc[max_rule_pictures["group"] == group, "score"].clip(lower=low)
+        ax.hist(s, bins=bins, color=colour, alpha=0.6, edgecolor="white", lw=0.3, label=f"{name}: {len(s)} pictures")
+    ax.axvline(FLAG_PERCENTILE, color="#0b0b0b", lw=1.2)
+    ax.set(yscale="log", xlim=(low, 100.5), ylabel="pictures (log scale)",
+           xlabel="max-rule score: percentile among the good pictures of the 12 non-test slides")
+    ax.spines[["top", "right"]].set_visible(False)
+ax_all.set_title(f"All scores (bars of 2 points; line = cut at {FLAG_PERCENTILE})", fontsize=11)
+ax_zoom.set_title("Zoom on 80-100 (bars of 0.5 points; scores below 80 in the first bar)", fontsize=11)
+ax_all.legend(frameon=False, loc="upper center")
+fig.suptitle(f"Final max rule: one score per picture, {len(max_rule_pictures)} pictures (other milks: median of "
+             "their 4 runs)", fontsize=12)
+save_figure(fig, RESULTS_DIR / "final_max_rule_histogram.png", OVERWRITE)
+plt.show()
+
+# %% [markdown]
+# ## Time per picture
+#
+# How long screening one picture takes, as a lab would use it: one picture at a time, on the GPU (GTX 1650)
+# and on the CPU only. Timed on `TIMING_PICTURES` random A-D pictures (after 3 warm-up pictures):
+# - **read picture**: reading the PNG (2048 x 1536) and cutting the ROI;
+# - **DINOv2 features + logistic regression**: the supervised part of the max rule (the whole picture shrunk to
+#   768 x 576);
+# - **DFM, 12 tiles**: the anomaly part of the max rule (12 native tiles);
+# - **CNN ResNet-18, whole picture**: for comparison.
+#
+# The models: logistic regression trained on run 1's training pictures, DFM fitted on 40 good pictures (the time
+# hardly depends on how many), ResNet-18 of run 1. The max rule = read + DINOv2 + logistic regression + DFM.
+
+# %%
+# Time per picture on the GPU (if there is one) and on the CPU only
+rng = np.random.default_rng(SEED)
+timing_paths = [Path(image_paths[f])
+                for f in rng.choice(eval_info.index[eval_info["fold"].notna()], TIMING_PICTURES + 3, replace=False)]
+dinov2_whole, _ = deep_feature_tables(deep_features["dinov2_vits14"])
+run1_train = (run_roles(dinov2_whole["file"].map(eval_info["fold"]), 1) == "train").to_numpy()
+timing_lr = SUPERVISED_MODELS["Logistic regression"]()
+timing_lr.fit(dinov2_whole.drop(columns="file").to_numpy(float)[run1_train],
+              dinov2_whole["file"].map(eval_info["is_defect"]).astype(int).to_numpy()[run1_train])
+run1_good = eval_info.index[(run_roles(eval_info["fold"], 1) == "train") & (eval_info["label"] == "good")]
+timing_dinov2 = make_backbone(DEEP_BACKBONES["dinov2_vits14"])
+timing_dfm = make_dfm()
+fit_dfm(timing_dfm, [Path(image_paths[f]) for f in sorted(run1_good)[:40]], "DFM for timing: fit on 40 good images")
+timing_cnn = TwoHeadCNN(CNN_BACKBONES["resnet18"], len(t2_classes)).to(DEVICE)
+timing_cnn.load_state_dict(torch.load(CNN_DIR / f"resnet18_whole_run1_{data['KEY']}" / "best.pt", map_location=DEVICE))
+model_steps = {
+    "DINOv2 features + logistic regression": lambda roi: picture_score_dinov2(timing_dinov2, timing_lr, roi),
+    "DFM, 12 tiles": lambda roi: picture_tile_scores_dfm(timing_dfm, roi),
+    "CNN ResNet-18, whole picture": lambda roi: picture_score_cnn(timing_cnn, roi),
+}
+timing = {}
+devices = (["cuda"] if torch.cuda.is_available() else []) + ["cpu"]
+try:
+    for DEVICE in devices:  # the helpers run on DEVICE; set back to the default below
+        for model in (timing_dinov2, timing_dfm, timing_cnn):
+            model.to(DEVICE)
+        timing[DEVICE] = time_per_picture(model_steps, timing_paths)
+finally:
+    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+del timing_dinov2, timing_dfm, timing_cnn
+torch.cuda.empty_cache()
+
+device_names = {"cuda": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "",
+                "cpu": f"CPU only ({torch.get_num_threads()} threads)"}
+timing_rows = []
+for device, t in timing.items():
+    steps = {
+        **{c: t[c] for c in t.columns},
+        "max rule (read + DINOv2 + LR + DFM)": t["read picture"] + t["DINOv2 features + logistic regression"]
+                                               + t["DFM, 12 tiles"],
+        "best supervised (read + DINOv2 + LR)": t["read picture"] + t["DINOv2 features + logistic regression"],
+        "CNN ResNet-18 (read + CNN)": t["read picture"] + t["CNN ResNet-18, whole picture"],
+    }
+    for step, seconds in steps.items():
+        timing_rows.append({"device": device_names[device], "step": step, "seconds per picture": seconds.mean(),
+                            "SD": seconds.std(), "pictures per hour": 3600 / seconds.mean()})
+data["FINAL_TIMING"] = pd.DataFrame(timing_rows)
+save_table(data["FINAL_TIMING"].round(4), RESULTS_DIR / "final_time_per_picture.csv", OVERWRITE)
+data["FINAL_TIMING"].set_index(["step", "device"]).unstack("device").round(3)
 
 # %% [markdown]
 # # Experiments
