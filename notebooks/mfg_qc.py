@@ -1207,8 +1207,28 @@ def harmonic_mean(values: list[float]) -> float:
     return 0.0 if min(values) <= 0 else len(values) / sum(1 / v for v in values)
 
 
+def reference_roles(reference: str) -> list[str]:
+    """Return the roles whose good pictures set the cut (the reference of the unusualness).
+
+    Args:
+        reference (str): "validation" = the good pictures of the validation fold (4 slides);
+            "non-test" = also those of the two training folds (12 slides). With "non-test" the training
+            pictures must be scored by models that did not learn from them (see out_of_fold_scores).
+
+    Returns:
+        list[str]: e.g. ["validation"] or ["validation", "train"].
+
+    Raises:
+        ValueError: if reference is not "validation" or "non-test".
+    """
+    if reference not in ("validation", "non-test"):
+        raise ValueError(f"reference must be 'validation' or 'non-test', got {reference}")
+    return ["validation"] if reference == "validation" else ["validation", "train"]
+
+
 def evaluate_method(
-    scores: pd.DataFrame, info: pd.DataFrame, two_sided: bool, cut: float | None = None
+    scores: pd.DataFrame, info: pd.DataFrame, two_sided: bool, cut: float | None = None,
+    reference: str = "validation",
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Evaluate one method in all runs with the common rules (percentile of good validation, 95 % cut).
 
@@ -1221,6 +1241,8 @@ def evaluate_method(
         two_sided (bool): True for single features (a defect can move them either way).
         cut (float | None): None = the common rule (flag if u > FLAG_PERCENTILE); a number = flag
             the images whose score is above it instead, e.g. 2.5 for votes: "at least 3 of 5 models".
+        reference (str): whose good pictures set the cut: "validation" (4 slides, the sections above) or
+            "non-test" (12 slides, "Final evaluation"; then the good training pictures need scores too).
 
     Returns:
         tuple[pd.DataFrame, pd.DataFrame]:
@@ -1235,15 +1257,17 @@ def evaluate_method(
     """
     metric_rows, prediction_parts = [], []
     defect = info["is_defect"].astype(bool)
+    ref_roles = reference_roles(reference)
     for run in scores.columns:
         roles = run_roles(info["fold"], run)
         s = scores[run].reindex(info.index)
-        needed = roles.isin(["test", "test_only"]) | ((roles == "validation") & (info["label"] == "good"))
+        good_ref = roles.isin(ref_roles) & (info["label"] == "good")
+        needed = roles.isin(["test", "test_only"]) | good_ref
         missing = s.index[needed & s.isna()]
         if len(missing):  # e.g. saved results from before images were added
             raise ValueError(f"No score for {len(missing)} images (e.g. {missing[0]}); "
                              "the saved results are out of date: set USE_SAVED_RESULTS = False")
-        good_val = s[(roles == "validation") & (info["label"] == "good")]
+        good_val = s[good_ref]
         u = pd.Series(unusualness(s, good_val, two_sided), index=info.index)
         flagged = u > FLAG_PERCENTILE if cut is None else s > cut
         if two_sided:  # for AUROC / ROC only: u with its ties at 100 broken (decisions use u)
@@ -2205,7 +2229,7 @@ def plot_anomaly_maps(examples: list[dict], vmin: float, vmax: float, title: str
     return fig
 
 
-def run_unusualness(scores: pd.DataFrame, info: pd.DataFrame) -> pd.DataFrame:
+def run_unusualness(scores: pd.DataFrame, info: pd.DataFrame, reference: str = "validation") -> pd.DataFrame:
     """Return every image's unusualness (0-100) in every run, as evaluate_method computes it.
 
     u = percentile of the image's score among the scores of the good validation images of the run
@@ -2215,17 +2239,128 @@ def run_unusualness(scores: pd.DataFrame, info: pd.DataFrame) -> pd.DataFrame:
     Args:
         scores (pd.DataFrame): index = file, one column per run (1-4), e.g. method_scores["Mahalanobis | whole"].
         info (pd.DataFrame): index = file (images that are not excluded), columns fold, label.
+        reference (str): "validation" (4 slides) or "non-test" (12 slides), as in evaluate_method.
 
     Returns:
         pd.DataFrame: index = info.index, one column per run with u; NaN where the method has no
             score (e.g. training images, which DFM and PatchCore do not score).
     """
+    ref_roles = reference_roles(reference)
     out = {}
     for run in scores.columns:
         roles = run_roles(info["fold"], run)
         s = scores[run].reindex(info.index)
-        good_val = s[(roles == "validation") & (info["label"] == "good")]
+        good_val = s[roles.isin(ref_roles) & (info["label"] == "good")]
         out[run] = pd.Series(unusualness(s, good_val, two_sided=False), index=info.index).where(s.notna())
+    return pd.DataFrame(out)
+
+
+def train_folds(run: int) -> list[int]:
+    """Return the two training folds of a run (neither its test fold nor its validation fold).
+
+    Args:
+        run (int): the run (= its test fold), 1-4.
+
+    Returns:
+        list[int]: e.g. run 1 (test 1, validation 2) -> [3, 4].
+    """
+    return [f for f in FOLDS if f not in (run, VALIDATION_FOLD[run])]
+
+
+def fold_pair_scores(table: pd.DataFrame, info: pd.DataFrame, make_model, pair: tuple[int, int],
+                     kind: str) -> np.ndarray:
+    """Train one model on a pair of folds and score every row (the same steps as one_class_scores /
+    supervised_scores, only with a different pair of training folds).
+
+    Args:
+        table (pd.DataFrame): one row per whole picture or tile, with "file" and the feature columns.
+        info (pd.DataFrame): index = file, columns fold, label, is_defect.
+        make_model (callable): makes a new untrained model, e.g. ONE_CLASS_DETECTORS["LOF"].
+        pair (tuple[int, int]): the two training folds, e.g. (1, 3).
+        kind (str): "one-class" (learns from the good rows of the pair, features standardised on them)
+            or "supervised" (learns from all rows of the pair; returns P(defective)).
+
+    Returns:
+        np.ndarray: one score per row of table, higher = more defective.
+    """
+    feature_cols = [c for c in table.columns if c not in ("file", "tile_idx")]
+    x_all = table[feature_cols].to_numpy(dtype=float)
+    train = table["file"].map(info["fold"]).isin(pair).to_numpy()
+    if kind == "one-class":
+        good = (table["file"].map(info["label"]) == "good").to_numpy()
+        scaler = StandardScaler().fit(x_all[train & good])
+        x = scaler.transform(x_all)
+        detector = make_model()
+        detector.fit(x[train & good])
+        return anomaly_scores(detector, x)
+    y = table["file"].map(info["is_defect"]).astype(int).to_numpy()
+    model = make_model()
+    model.fit(x_all[train], y[train])
+    return model.predict_proba(x_all)[:, 1]
+
+
+def run_extra_pairs(models: dict, whole: pd.DataFrame, tiles: pd.DataFrame, info: pd.DataFrame, kind: str,
+                    pairs: list[tuple[int, int]], desc: str) -> dict:
+    """Train every model on the fold pairs no run trains on, on whole pictures and tiles; return image scores.
+
+    Args:
+        models (dict): name -> function that makes a new model, e.g. SUPERVISED_MODELS.
+        whole (pd.DataFrame): whole-picture features. tiles (pd.DataFrame): tile features.
+        info (pd.DataFrame): index = file, columns fold, label, is_defect.
+        kind (str): "one-class" or "supervised", as in fold_pair_scores.
+        pairs (list[tuple[int, int]]): e.g. [(1, 3), (2, 4)].
+        desc (str): label of the progress bar, e.g. "handcrafted supervised".
+
+    Returns:
+        dict: (model name, input) -> {pair: image scores (pd.Series, index = file)}; input is "whole",
+            "tiles max" or "tiles mean", as in run_models.
+    """
+    results = {}
+    progress = tqdm(total=len(models) * 2 * len(pairs), desc=desc, unit="model")
+    for name, make in models.items():
+        for input_name, table in [("whole", whole), ("tiles", tiles)]:
+            for pair in pairs:
+                progress.set_postfix_str(f"{name} | {input_name} | folds {pair[0]} + {pair[1]}")
+                s = pd.Series(fold_pair_scores(table, info, make, pair, kind))
+                if input_name == "whole":
+                    results.setdefault((name, "whole"), {})[pair] = s.set_axis(table["file"].to_numpy())
+                else:
+                    for agg in ("max", "mean"):
+                        results.setdefault((name, f"tiles {agg}"), {})[pair] = (
+                            s.groupby(table["file"].to_numpy()).agg(agg))
+                progress.update(1)
+    progress.close()
+    return results
+
+
+def out_of_fold_scores(scores: pd.DataFrame, extra: dict, info: pd.DataFrame) -> pd.DataFrame:
+    """Return a method's scores in which every training picture is scored by a model that never saw it.
+
+    In run k the model learned from the two training folds, so it rates their pictures too normal. Here
+    each training fold j gets the scores of the model trained on the other training fold and the
+    validation fold instead (the same amount of data, and never the test fold). These models are either
+    another run's own model, or one of the extra fold-pair models. Example, run 1 (test 1, validation 2,
+    training 3 and 4): fold 3 is scored by the model of folds 2 + 4 (extra), fold 4 by that of folds
+    2 + 3 (= run 4's model). Test, validation and test-only pictures keep the run's own scores.
+
+    Args:
+        scores (pd.DataFrame): index = file, columns = runs 1-4: the method's own scores (all pictures).
+        extra (dict): {pair: image scores (pd.Series)} for the pairs no run trains on, from run_extra_pairs.
+        info (pd.DataFrame): index = file, column fold.
+
+    Returns:
+        pd.DataFrame: same shape as scores, with the training pictures' scores replaced.
+    """
+    by_pair = {tuple(sorted(train_folds(run))): scores[run] for run in scores.columns}
+    by_pair.update(extra)
+    out = {}
+    for run in scores.columns:
+        s = scores[run].copy()
+        for j in train_folds(run):
+            other = [f for f in train_folds(run) if f != j][0]
+            rows = info.index[info["fold"] == j].intersection(s.index)
+            s.loc[rows] = by_pair[tuple(sorted((other, VALIDATION_FOLD[run])))].reindex(rows).to_numpy()
+        out[run] = s
     return pd.DataFrame(out)
 
 
@@ -4475,6 +4610,137 @@ data["BENCHMARK"] = pd.concat([family_best, combined_best, votes_best])[benchmar
     "balanced_accuracy", ascending=False)
 save_table(data["BENCHMARK"].round(4), RESULTS_DIR / "benchmark_summary.csv", OVERWRITE)
 data["BENCHMARK"].set_index("method").round(2)
+
+# %% [markdown]
+# # Final evaluation
+#
+# The numbers for the paper. Three changes against the sections above, all decided before these results
+# were seen:
+# 1. **Steadier cut (12 slides).** The cut of every method comes from the good pictures of all 12 slides that
+#    are not tested in the run (the validation fold and both training folds), not only from the 4 validation
+#    slides. The training pictures are scored by models that never saw them. The test fold is never used.
+#    The CNNs keep the 4-slide cut (a 12-slide cut would need 8 more trainings per network).
+# 2. **Choice on non-test data** (next step): every run chooses its methods using only the non-test folds.
+# 3. **Statistics** (next step): confidence intervals by preparation and McNemar tests.
+#
+# The max-rule cut stays at the 95th percentile. PaDiM is not carried into the final evaluation: it models
+# every patch position separately, which suits aligned objects, not freely chosen fields of view (its
+# results above stay as the expected negative result).
+
+# %% [markdown]
+# ## Steadier cut: 12 slides
+#
+# Run 1 as an example: test fold 1, validation fold 2, training folds 3 and 4. The run's model learned from
+# folds 3 and 4, so it rates their good pictures too normal. Fold 3 is therefore scored by a model trained on
+# folds 2 + 4, and fold 4 by a model trained on folds 2 + 3 (the same amount of data, never the test fold).
+# Four of the six fold pairs are the runs' own models; only the pairs 1 + 3 and 2 + 4 need new models: two more
+# models for every scikit-learn method (handcrafted and deep features, one-class and supervised), about
+# 15 min the first time (saved afterwards).
+#
+# Result: every method with the 4-slide and the 12-slide cut (false alarms, balanced accuracy, HAR, frozen
+# milk), a figure of the change, and a check of the globule threshold.
+
+# %%
+# Extra fold-pair models of every scikit-learn method, then its out-of-fold scores
+all_pairs = [(a, b) for a in sorted(FOLDS) for b in sorted(FOLDS) if a < b]
+run_pairs = {tuple(sorted(train_folds(run))) for run in FOLDS}
+extra_pairs = [pair for pair in all_pairs if pair not in run_pairs]
+print(f"Fold pairs of the runs' own models: {sorted(run_pairs)}; extra models: {extra_pairs}")
+
+final_scores, final_families = {}, {}  # method -> scores with out-of-fold training pictures; method -> family
+for source, kind in [("handcrafted", "one-class"), ("handcrafted", "supervised")] + [
+        (backbone, kind) for backbone in deep_features for kind in ("one-class", "supervised")]:
+    models = ONE_CLASS_DETECTORS if kind == "one-class" else SUPERVISED_MODELS
+    if source == "handcrafted":
+        own = one_class_image_scores if kind == "one-class" else supervised_image_scores
+        tables = lambda: (data["WHOLE_FEATURES"], data["TILE_FEATURES"])
+    else:
+        own = deep_image_scores[(source, kind)]
+        tables = lambda: deep_feature_tables(deep_features[source])
+    extra = load_or_compute(
+        CACHE_DIR / f"extra_pairs_{source}_{kind}_{data['KEY']}.pkl",
+        lambda: run_extra_pairs(models, *tables(), eval_info, kind, extra_pairs, desc=f"{source} {kind}"),
+        USE_SAVED_RESULTS)
+    for (name, input_name), image_scores in own.items():
+        method = f"{name} | {input_name}" if source == "handcrafted" else f"{source} {name} | {input_name}"
+        final_scores[method] = out_of_fold_scores(image_scores, extra[(name, input_name)], eval_info)
+        final_families[method] = f"{'handcrafted' if source == 'handcrafted' else 'deep'} {kind}"
+print(f"{len(final_scores)} scikit-learn methods with out-of-fold scores")
+
+# %%
+# Every scikit-learn method with the 4-slide cut (as in the sections above) and with the 12-slide cut
+final_results = {method: evaluate_method(s, eval_info, two_sided=False, reference="non-test")
+                 for method, s in final_scores.items()}  # method -> (metrics per run, predictions)
+data["FINAL_SKLEARN"] = pd.DataFrame([{"family": final_families[method], **summary_row(method, *result, eval_labels)}
+                                      for method, result in final_results.items()])
+save_table(data["FINAL_SKLEARN"].round(4), RESULTS_DIR / "final_sklearn_summary.csv", OVERWRITE)
+four = pd.DataFrame([summary_row(m, *evaluate_method(method_scores[m], eval_info, two_sided=False), eval_labels)
+                     for m in final_scores]).set_index("method")
+twelve = data["FINAL_SKLEARN"].set_index("method")
+data["FINAL_CUT"] = pd.DataFrame({
+    "family": twelve["family"],
+    "false_alarms_4": four["false_alarms_pct"], "false_alarms_sd_4": four["false_alarms_sd_pct"],
+    "false_alarms_12": twelve["false_alarms_pct"], "false_alarms_sd_12": twelve["false_alarms_sd_pct"],
+    "balanced_accuracy_4": four["balanced_accuracy"], "balanced_accuracy_12": twelve["balanced_accuracy"],
+    "har_4": four["har"], "har_12": twelve["har"], "frozen_4": four["frozen"], "frozen_12": twelve["frozen"],
+})
+save_table(data["FINAL_CUT"].reset_index().round(4), RESULTS_DIR / "final_cut_4_vs_12_slides.csv", OVERWRITE)
+mean = data["FINAL_CUT"].mean(numeric_only=True)
+print(f"Mean over {len(data['FINAL_CUT'])} methods, 4 -> 12 slides: false alarms {mean['false_alarms_4']:.1f} -> "
+      f"{mean['false_alarms_12']:.1f} %, their spread between runs (SD) {mean['false_alarms_sd_4']:.1f} -> "
+      f"{mean['false_alarms_sd_12']:.1f} points, balanced accuracy {mean['balanced_accuracy_4']:.3f} -> "
+      f"{mean['balanced_accuracy_12']:.3f}")
+data["FINAL_CUT"].sort_values("balanced_accuracy_12", ascending=False).head(20).round(3)
+
+# %%
+# Figure: every method's false alarms (mean over the 4 runs) against their spread between runs, 4 -> 12 slides
+fig, ax = plt.subplots(figsize=(8, 6), constrained_layout=True)
+cut_table = data["FINAL_CUT"]
+for _, r in cut_table.iterrows():
+    ax.plot([r["false_alarms_4"], r["false_alarms_12"]], [r["false_alarms_sd_4"], r["false_alarms_sd_12"]],
+            color="#cfcfcf", lw=0.8, zorder=1)
+ax.scatter(cut_table["false_alarms_4"], cut_table["false_alarms_sd_4"], s=18, color=REFERENCE_COLOUR,
+           label="cut from 4 validation slides", zorder=2)
+ax.scatter(cut_table["false_alarms_12"], cut_table["false_alarms_sd_12"], s=18, color=SERIES_COLOUR,
+           label="cut from 12 non-test slides", zorder=3)
+ax.set(xlabel="false alarms on good test pictures, mean of 4 runs (%)",
+       ylabel="spread of the false alarms between runs (SD, points)",
+       title=f"Steadier cut: {len(cut_table)} scikit-learn methods (line = the same method)")
+ax.legend(frameon=False)
+ax.spines[["top", "right"]].set_visible(False)
+save_figure(fig, RESULTS_DIR / "final_cut_4_vs_12_slides.png", OVERWRITE)
+plt.show()
+
+# %% [markdown]
+# **Globule threshold check.** The globule threshold $t$ of the handcrafted features was found once on all
+# 609 good pictures, test folds included. Here it is found again in every run from the good pictures of the
+# training folds only; if the values hardly differ, using one threshold for all runs does not matter.
+
+# %%
+# Globule threshold per run from the good pictures of the training folds only, against the one used.
+# The deviation counts of the good pictures are loaded again under their own name (`counts` is reused later)
+good_counts = load_or_compute(
+    CACHE_DIR / "globule_deviation_counts.pkl",
+    lambda: run_parallel(
+        partial(deviation_counts, roi=ROI, tile=CROP_SIZE, whole_size=WHOLE_SIZE,
+                sigma_tile=GLOBULE_BLUR_SIGMA, sigma_whole=GLOBULE_BLUR_SIGMA_WHOLE),
+        good_paths, DATA_WORKERS, desc="D of good images",
+    ),
+    USE_SAVED_RESULTS,
+)
+path_fold = data["TILES"].drop_duplicates("path").set_index("path")["fold"]
+threshold_rows = []
+for run in FOLDS:
+    keep = [i for i, p in enumerate(good_paths) if path_fold[str(p)] in train_folds(run)]
+    threshold_rows.append({
+        "good pictures": len(keep),
+        "tiles": float(threshold_otsu(hist=(sum(good_counts[i][0] for i in keep), bin_centres))),
+        "whole pictures": float(threshold_otsu(hist=(sum(good_counts[i][1] for i in keep), bin_centres))),
+    })
+threshold_check = pd.DataFrame(threshold_rows, index=[f"run {run}: training folds" for run in FOLDS])
+threshold_check.loc["all good pictures (used)"] = [len(good_paths), data["GLOBULE_THRESHOLD"],
+                                                   data["GLOBULE_THRESHOLD_WHOLE"]]
+threshold_check.round(2)
 
 # %% [markdown]
 # # Experiments
