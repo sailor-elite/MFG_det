@@ -294,6 +294,9 @@ VOTES_NEEDED = [1, 2, 3, 4, 5]  # flag an image if at least this many voters fla
 # Benchmark: the best method of each of the 6 families by balanced accuracy; the n best of them vote, and
 # an image is flagged if at least k of them flag it
 BENCHMARK_VOTES = [(6, 1), (3, 2)]  # (n voters, k votes needed): any of the 6; 2 of the 3 best
+# Final evaluation: the same votes among the family bests with the 12-slide cut (5 families: the CNNs keep
+# the 4-slide cut and do not vote); chosen per run on non-test data
+FINAL_VOTES = [(5, 1), (3, 2)]  # (n voters, k votes needed): any of the 5; 2 of the 3 best
 
 # CNNs (CLAUDE.md §9 Step 5): ImageNet networks fine-tuned with two outputs, good vs defective (T1) and
 # which label (T2). Design A: the whole picture (WHOLE_SIZE). Trained in fp32: fp16 overflows in these
@@ -2386,6 +2389,71 @@ def run_extra_pairs(models: dict, whole: pd.DataFrame, tiles: pd.DataFrame, info
                 progress.update(1)
     progress.close()
     return results
+
+
+def choice_score(unusual: pd.DataFrame, info: pd.DataFrame, run: int, reference: str) -> float:
+    """Return a method's balanced accuracy in one run on non-test pictures: the criterion for choosing methods
+    without the test fold.
+
+    The method's own decisions (u > FLAG_PERCENTILE) on the A-D pictures of the reference folds: the
+    validation and both training folds (reference "non-test": out-of-fold scores, 12-slide cut), or the
+    validation fold only (reference "validation": the CNNs, 4-slide cut). The good pictures there also set the
+    cut, so their false alarms are near 5 %; the criterion mostly rewards detection.
+    Example: 90 % of the non-test defective pictures flagged, 5 % of the good ones -> (0.90 + 0.95) / 2 = 0.925.
+
+    Args:
+        unusual (pd.DataFrame): from run_unusualness with the same reference, index = file, columns = runs.
+        info (pd.DataFrame): index = file, columns fold, is_defect.
+        run (int): the run, 1-4.
+        reference (str): "non-test" or "validation".
+
+    Returns:
+        float: balanced accuracy, 0-1.
+    """
+    roles = run_roles(info["fold"], run)
+    rows = roles.isin(reference_roles(reference)) & unusual[run].notna()
+    flagged = unusual[run] > FLAG_PERCENTILE
+    defect = info["is_defect"].astype(bool)
+    return float((flagged[rows & defect].mean() + 1 - flagged[rows & ~defect].mean()) / 2)
+
+
+def evaluate_per_run(columns: dict, info: pd.DataFrame, reference: str,
+                     cut: float | None = None) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Evaluate a method whose scores come from different models in different runs (e.g. chosen per run).
+
+    Every run is evaluated on its own with evaluate_method, then the runs are put together.
+
+    Args:
+        columns (dict): run -> pd.Series of scores (index = file), e.g. the chosen method's scores in each run.
+        info (pd.DataFrame): index = file, columns fold, label, is_defect.
+        reference (str): "validation" or "non-test", as in evaluate_method.
+        cut (float | None): as in evaluate_method, e.g. 1.5 for "at least 2 votes".
+
+    Returns:
+        tuple[pd.DataFrame, pd.DataFrame]: metrics (one row per run) and predictions, as evaluate_method.
+    """
+    parts = [evaluate_method(pd.DataFrame({run: s}), info, two_sided=False, cut=cut, reference=reference)
+             for run, s in columns.items()]
+    return pd.concat([m for m, _ in parts]), pd.concat([p for _, p in parts], ignore_index=True)
+
+
+def class_har(row: dict | pd.Series, label_order: list[str]) -> tuple[float, str, float]:
+    """Return the per-class HAR of a summary row: the harmonic mean of the pass rate on good and the
+    detection rate of every bad class (defect types and other milks), and the worst of these classes.
+
+    The harmonic mean is low when any single class is low: 8 classes at 100 % and one at 20 % give 69
+    (9 / (8 / 100 + 1 / 20)), while their plain mean would be 91.
+
+    Args:
+        row (dict | pd.Series): from summary_row (false_alarms_pct and the % flagged of every label).
+        label_order (list[str]): all labels, good first, e.g. eval_labels.
+
+    Returns:
+        tuple[float, str, float]: per-class HAR (0-100), the worst class (e.g. "undiluted"), its rate (%).
+    """
+    rates = {"good": 100 - row["false_alarms_pct"], **{label: row[label] for label in label_order if label != "good"}}
+    worst = min(rates, key=rates.get)
+    return len(rates) / sum(1 / max(r, 0.1) for r in rates.values()), worst, rates[worst]
 
 
 def out_of_fold_scores(scores: pd.DataFrame, extra: dict, info: pd.DataFrame) -> pd.DataFrame:
@@ -4864,6 +4932,92 @@ for name, saved_name in [("DFM", f"DFM {DFM_BACKBONE.split('.')[0]}"), ("PatchCo
 data["FINAL_ANOMALY"] = pd.DataFrame(anomaly_rows).set_index("method")
 save_table(data["FINAL_ANOMALY"].reset_index().round(4), RESULTS_DIR / "final_anomaly_4_vs_12_slides.csv", OVERWRITE)
 data["FINAL_ANOMALY"].round(3)
+
+# %% [markdown]
+# ## Choice on non-test data, and the final benchmark
+#
+# In every run the methods are chosen without the test fold. The criterion is a method's balanced accuracy on
+# the non-test pictures of that run: the A-D pictures of the validation fold and both training folds, with
+# their out-of-fold scores and the 12-slide cut (for the CNNs, which have no out-of-fold scores: the
+# validation fold with the 4-slide cut). Then, as decided in advance:
+# - **Best of each family**: the family's method with the highest criterion; it may differ between runs.
+# - **Votes** (`FINAL_VOTES`): the family bests of the 5 families with the 12-slide cut (the CNNs do not vote)
+#   each decide on their own; flagged if at least k of the n best flag the picture.
+# - **Max rule**: the best supervised method (handcrafted or deep features) + the best anomaly model (DFM or
+#   PatchCore), both with the 12-slide cut; the higher of their two unusualness values; flagged above the
+#   95th percentile of the good pictures of the 12 non-test slides.
+#
+# Only then is everything tested on the test fold. Besides balanced accuracy and HAR (good vs defective), the
+# table gives the **per-class HAR**: the harmonic mean of the pass rate on good and the detection rate of each
+# of the 13 bad classes (9 defect types, 4 other milks); it is low when any single class is low.
+
+# %%
+# The criterion of every candidate in every run, on non-test data only, and each family's choice per run
+candidates = {method: (s, "non-test", final_families[method]) for method, s in final_scores.items()}
+for design, names in [("whole", CNN_BACKBONES), ("tiles", CNN_TILE_BACKBONES)]:
+    for name in names:
+        candidates[f"CNN {name} | {design}"] = (method_scores[f"CNN {name} | {design}"], "validation", "CNN")
+final_unusual = {method: run_unusualness(s, eval_info, reference=ref) for method, (s, ref, _) in candidates.items()}
+final_criterion = pd.DataFrame({run: {method: choice_score(final_unusual[method], eval_info, run, ref)
+                                      for method, (_, ref, _) in candidates.items()} for run in FOLDS})
+candidate_family = pd.Series({method: family for method, (_, _, family) in candidates.items()})
+final_choice = pd.DataFrame({run: final_criterion[run].groupby(candidate_family).idxmax() for run in FOLDS})
+final_choice.columns = [f"run {run}" for run in FOLDS]
+final_choice
+
+# %%
+# Test the choices on the test fold: the family bests, the votes and the max rule
+final_tested, members = {}, {}  # name -> (metrics per run, predictions); name -> its members per run
+twelve_families = [family for family in final_choice.index if family != "CNN"]
+for family in final_choice.index:  # best of each family, chosen per run
+    picks = {run: final_choice.loc[family, f"run {run}"] for run in FOLDS}
+    reference = "validation" if family == "CNN" else "non-test"
+    final_tested[f"best {family}"] = evaluate_per_run({run: candidates[m][0][run] for run, m in picks.items()},
+                                                      eval_info, reference)
+    members[f"best {family}"] = picks
+for n, k in FINAL_VOTES:  # votes of the family bests with the 12-slide cut
+    columns, picks = {}, {}
+    for run in FOLDS:
+        ranked = final_criterion.loc[final_choice.loc[twelve_families, f"run {run}"], run].sort_values(
+            ascending=False).index[:n]
+        columns[run] = sum((final_unusual[m][run] > FLAG_PERCENTILE).astype(float).where(final_unusual[m][run].notna())
+                           for m in ranked)
+        picks[run] = " + ".join(ranked)
+    final_tested[f"vote: at least {k} of {n} best"] = evaluate_per_run(columns, eval_info, "non-test", cut=k - 0.5)
+    members[f"vote: at least {k} of {n} best"] = picks
+columns, picks = {}, {}  # max rule: best supervised + best anomaly model, cut at the 95th percentile
+for run in FOLDS:
+    supervised = final_criterion.loc[final_choice.loc[["handcrafted supervised", "deep supervised"], f"run {run}"],
+                                     run].idxmax()
+    anomaly = final_choice.loc["anomaly detection", f"run {run}"]
+    columns[run] = np.maximum(final_unusual[supervised][run], final_unusual[anomaly][run])
+    picks[run] = f"{supervised} + {anomaly}"
+final_tested["max rule"] = evaluate_per_run(columns, eval_info, "non-test")
+members["max rule"] = picks
+data["FINAL_MEMBERS"] = pd.DataFrame(members).T.rename(columns=lambda run: f"run {run}")
+save_table(data["FINAL_MEMBERS"].reset_index(names="method"), RESULTS_DIR / "final_members.csv", OVERWRITE)
+data["FINAL_MEMBERS"].loc[[name for name in members if not name.startswith("best")]]
+
+# %%
+# The final benchmark: every result chosen on non-test data and tested on the test fold
+final_rows = []
+for name, result in final_tested.items():
+    row = summary_row(name, *result, eval_labels)
+    har_c, worst, worst_rate = class_har(row, eval_labels)
+    cut = "4 slides" if name == "best CNN" else "12 slides"
+    final_rows.append({"cut": cut, "class_har": har_c, "worst_class": f"{worst} ({worst_rate:.0f} %)", **row})
+data["FINAL_BENCHMARK"] = pd.DataFrame(final_rows).sort_values("balanced_accuracy", ascending=False)
+save_table(data["FINAL_BENCHMARK"].round(4), RESULTS_DIR / "final_benchmark.csv", OVERWRITE)
+data["FINAL_BENCHMARK"].set_index("method")[
+    ["cut", "auroc", "auroc_sd", "balanced_accuracy", "har", "class_har", "worst_class", "false_alarms_pct",
+     "false_alarms_sd_pct"] + eval_labels[1:]
+].round(2)
+
+# %%
+fig = plot_detection_heatmap(data["FINAL_BENCHMARK"], eval_labels,
+                             "Final benchmark: chosen on non-test data, tested on the test fold (12-slide cut; CNN: 4 slides)")
+save_figure(fig, RESULTS_DIR / "final_benchmark_heatmap.png", OVERWRITE)
+plt.show()
 
 # %% [markdown]
 # # Experiments
