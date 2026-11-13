@@ -59,6 +59,7 @@ from sklearn.neighbors import LocalOutlierFactor
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import OneClassSVM
+from statsmodels.stats.contingency_tables import mcnemar
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
@@ -297,6 +298,7 @@ BENCHMARK_VOTES = [(6, 1), (3, 2)]  # (n voters, k votes needed): any of the 6; 
 # Final evaluation: the same votes among the family bests with the 12-slide cut (5 families: the CNNs keep
 # the 4-slide cut and do not vote); chosen per run on non-test data
 FINAL_VOTES = [(5, 1), (3, 2)]  # (n voters, k votes needed): any of the 5; 2 of the 3 best
+BOOTSTRAP_RESAMPLES = 2000  # 95 % intervals: the preparations (slides) drawn again this many times
 
 # CNNs (CLAUDE.md §9 Step 5): ImageNet networks fine-tuned with two outputs, good vs defective (T1) and
 # which label (T2). Design A: the whole picture (WHOLE_SIZE). Trained in fp32: fp16 overflows in these
@@ -2454,6 +2456,133 @@ def class_har(row: dict | pd.Series, label_order: list[str]) -> tuple[float, str
     rates = {"good": 100 - row["false_alarms_pct"], **{label: row[label] for label in label_order if label != "good"}}
     worst = min(rates, key=rates.get)
     return len(rates) / sum(1 / max(r, 0.1) for r in rates.values()), worst, rates[worst]
+
+
+def picture_decisions(predictions: pd.DataFrame, prep_of: pd.Series) -> pd.DataFrame:
+    """Return one decision per picture from evaluate_method's predictions, so every picture counts once.
+
+    A-D pictures are tested in exactly one run (their test fold): flagged = 0 or 1. The other milks are tested
+    in all 4 runs: flagged = the share of runs that flag them, e.g. 0.75 if 3 of 4 runs do.
+
+    Args:
+        predictions (pd.DataFrame): from evaluate_method or evaluate_per_run (columns run, file, label,
+            is_defect, role, flagged).
+        prep_of (pd.Series): index = file, the preparation (slide), e.g. "A07".
+
+    Returns:
+        pd.DataFrame: index = file; columns label, is_defect, test_only (bool), flagged (0-1), prep.
+    """
+    decisions = predictions.groupby("file").agg(
+        label=("label", "first"), is_defect=("is_defect", "first"),
+        test_only=("role", lambda roles: bool((roles == "test_only").all())), flagged=("flagged", "mean"))
+    decisions["prep"] = prep_of.reindex(decisions.index).to_numpy()
+    return decisions
+
+
+def pooled_metrics(n: np.ndarray, f: np.ndarray, label_order: list[str]) -> dict[str, np.ndarray]:
+    """Return the metrics from picture counts per label, for many resamples at once.
+
+    Args:
+        n (np.ndarray): pictures per label, shape (k, n_labels) for k resamples, columns in label_order.
+        f (np.ndarray): flagged pictures per label (sums of 0-1 decisions), same shape.
+        label_order (list[str]): labels, good first, e.g. eval_labels.
+
+    Returns:
+        dict[str, np.ndarray]: arrays of shape (k,): balanced_accuracy and har (good vs the 9 defect types,
+            0-1), class_har (good + 13 bad classes, 0-100), false_alarms_pct, and the % flagged per bad label.
+    """
+    col = {label: i for i, label in enumerate(label_order)}
+    rate = f / np.maximum(n, 1e-12)
+    pass_good = 1 - rate[:, col["good"]]
+    defects = [col[label] for label in label_order if label != "good" and label not in TEST_ONLY_LABELS]
+    detected = f[:, defects].sum(axis=1) / n[:, defects].sum(axis=1)
+    rates = [pass_good] + [rate[:, col[label]] for label in label_order if label != "good"]
+    out = {
+        "balanced_accuracy": (detected + pass_good) / 2,
+        "har": 2 / (1 / np.maximum(pass_good, 1e-12) + 1 / np.maximum(detected, 1e-12)),
+        "class_har": 100 * len(rates) / sum(1 / np.maximum(r, 0.001) for r in rates),
+        "false_alarms_pct": 100 * (1 - pass_good),
+    }
+    out.update({label: 100 * rate[:, col[label]] for label in label_order if label != "good"})
+    return out
+
+
+def bootstrap_by_preparation(decisions: dict[str, pd.DataFrame], label_order: list[str], n_resamples: int,
+                             seed: int) -> dict[str, dict]:
+    """Cluster bootstrap: draw the preparations (slides) again with replacement and recompute the metrics.
+
+    Pictures of the same slide are alike, so slides, not pictures, are drawn. The draw is made within groups of
+    slides with the same labels (A; B; C; D; F; U; M01-M03 undiluted; M04-M05 diluted), so every resample keeps
+    16 A, 4 B, ..., 3 undiluted and 2 diluted 3.2 % milk slides, and no class can go missing. All methods use the
+    same resamples, so their differences can be compared resample by resample.
+
+    Args:
+        decisions (dict[str, pd.DataFrame]): method -> picture_decisions(...) (the same pictures for all).
+        label_order (list[str]): labels, good first, e.g. eval_labels.
+        n_resamples (int): e.g. BOOTSTRAP_RESAMPLES = 2000.
+        seed (int): random seed, e.g. SEED.
+
+    Returns:
+        dict[str, dict]: method -> {"point": metric -> float (all slides once), "boot": metric -> array of
+            shape (n_resamples,)}; metrics as in pooled_metrics.
+    """
+    first = next(iter(decisions.values()))
+    preps = sorted(first["prep"].unique())
+    label_sets = first.groupby("prep")["label"].agg(lambda labels: ",".join(sorted(set(labels))))
+    types = label_sets.reindex(preps).to_numpy()  # slides with the same labels form one group
+    rng = np.random.default_rng(seed)
+    draws = np.zeros((n_resamples, len(preps)))  # how often every slide is drawn in every resample
+    for t in np.unique(types):
+        members = np.flatnonzero(types == t)
+        picks = members[rng.integers(len(members), size=(n_resamples, len(members)))]
+        for k in range(n_resamples):
+            np.add.at(draws[k], picks[k], 1)
+    out = {}
+    for method, d in decisions.items():
+        n = d.pivot_table(index="prep", columns="label", values="flagged", aggfunc="size", fill_value=0)
+        f = d.pivot_table(index="prep", columns="label", values="flagged", aggfunc="sum", fill_value=0)
+        n, f = (x.reindex(index=preps, columns=label_order, fill_value=0).to_numpy(float) for x in (n, f))
+        point = pooled_metrics(n.sum(axis=0, keepdims=True), f.sum(axis=0, keepdims=True), label_order)
+        out[method] = {"point": {m: float(v[0]) for m, v in point.items()},
+                       "boot": pooled_metrics(draws @ n, draws @ f, label_order)}
+    return out
+
+
+def with_interval(boot: dict, metric: str, digits: int) -> str:
+    """Return a metric with its 95 % bootstrap interval as text for a table.
+
+    Args:
+        boot (dict): one method's entry of bootstrap_by_preparation ({"point": ..., "boot": ...}).
+        metric (str): e.g. "balanced_accuracy" or "frozen".
+        digits (int): decimals, e.g. 3.
+
+    Returns:
+        str: e.g. "0.911 (0.887-0.931)": the value with all slides once, then the middle 95 % of the resamples.
+    """
+    low, high = np.percentile(boot["boot"][metric], [2.5, 97.5])
+    return f"{boot['point'][metric]:.{digits}f} ({low:.{digits}f}-{high:.{digits}f})"
+
+
+def mcnemar_test(a: pd.DataFrame, b: pd.DataFrame) -> dict:
+    """Compare two methods on the same A-D test pictures with McNemar's test (right vs wrong per picture).
+
+    Only the pictures that one method gets right and the other wrong count. The exact test is used when
+    there are fewer than 25 such pictures. Pictures of one slide are alike, so the p-value is optimistic.
+
+    Args:
+        a, b (pd.DataFrame): picture_decisions of the two methods.
+
+    Returns:
+        dict: only_a_right, only_b_right (int: pictures one method gets right and the other wrong), p_value.
+    """
+    rows = a.index[~a["test_only"]]
+    right_a = (a.loc[rows, "flagged"] >= 0.5) == a.loc[rows, "is_defect"].astype(bool)
+    right_b = (b.loc[rows, "flagged"] >= 0.5) == b.loc[rows, "is_defect"].astype(bool)
+    table = [[int((right_a & right_b).sum()), int((right_a & ~right_b).sum())],
+             [int((~right_a & right_b).sum()), int((~right_a & ~right_b).sum())]]
+    discordant = table[0][1] + table[1][0]
+    result = mcnemar(table, exact=discordant < 25, correction=True)
+    return {"only_a_right": table[0][1], "only_b_right": table[1][0], "p_value": float(result.pvalue)}
 
 
 def out_of_fold_scores(scores: pd.DataFrame, extra: dict, info: pd.DataFrame) -> pd.DataFrame:
@@ -5017,6 +5146,81 @@ data["FINAL_BENCHMARK"].set_index("method")[
 fig = plot_detection_heatmap(data["FINAL_BENCHMARK"], eval_labels,
                              "Final benchmark: chosen on non-test data, tested on the test fold (12-slide cut; CNN: 4 slides)")
 save_figure(fig, RESULTS_DIR / "final_benchmark_heatmap.png", OVERWRITE)
+plt.show()
+
+# %% [markdown]
+# ## Statistics: confidence intervals and paired comparisons
+#
+# **95 % confidence intervals by preparation (cluster bootstrap).** Pictures of the same slide are alike, so
+# the slides, not the pictures, are drawn again: `BOOTSTRAP_RESAMPLES` times the preparations are drawn with
+# replacement (within groups of slides with the same labels, so every resample has 16 A, 4 B, 4 C, 4 D, 3 F,
+# 3 U, 3 undiluted and 2 diluted 3.2 % milk slides) and the
+# metrics are computed again; the interval is the middle 95 % of the results. Every picture counts once: A-D
+# pictures with the decision of their test fold, the other milks with the share of the 4 runs that flag them.
+# These pooled numbers differ slightly from the means over the 4 runs in the table above.
+#
+# **Paired comparisons** on the same test pictures: McNemar's test counts the A-D pictures that one method gets
+# right and the other wrong (it treats the pictures as independent, so its p-values are optimistic); the
+# bootstrap gives a 95 % interval of the difference with the slides drawn again (the safer measure: if it
+# does not include 0, the difference is unlikely to be luck).
+#
+# **Light vs heavy blur (RQ2):** detection of both blur levels, with their intervals.
+
+# %%
+# One decision per picture for every final method, then 95 % intervals by preparation
+prep_of = manifest.set_index("file")["prep_id"]
+final_decisions = {name: picture_decisions(result[1], prep_of) for name, result in final_tested.items()}
+final_boot = bootstrap_by_preparation(final_decisions, eval_labels, BOOTSTRAP_RESAMPLES, SEED)
+data["FINAL_CI"] = pd.DataFrame({
+    name: {"balanced accuracy": with_interval(b, "balanced_accuracy", 3), "HAR": with_interval(b, "har", 3),
+           "per-class HAR": with_interval(b, "class_har", 1), "false alarms %": with_interval(b, "false_alarms_pct", 1),
+           **{f"{label} %": with_interval(b, label, 1) for label in eval_labels[1:]}}
+    for name, b in final_boot.items()
+}).T.loc[data["FINAL_BENCHMARK"]["method"]]
+save_table(data["FINAL_CI"].reset_index(names="method"), RESULTS_DIR / "final_benchmark_ci.csv", OVERWRITE)
+data["FINAL_CI"][["balanced accuracy", "HAR", "per-class HAR", "false alarms %"]]
+
+# %%
+# The max rule: every class with its 95 % interval
+data["FINAL_CI"].loc["max rule", [f"{label} %" for label in eval_labels[1:]]].to_frame("max rule: % flagged (95 % interval)")
+
+# %%
+# Paired comparisons: McNemar on the A-D test pictures, and the bootstrap interval of the difference (a - b)
+comparison_pairs = [("max rule", "best deep supervised"), ("max rule", "vote: at least 2 of 3 best"),
+                    ("vote: at least 2 of 3 best", "best deep supervised"), ("max rule", "best CNN")]
+comparison_rows = []
+for a, b in comparison_pairs:
+    test = mcnemar_test(final_decisions[a], final_decisions[b])
+    row = {"a": a, "b": b, "only a right": test["only_a_right"], "only b right": test["only_b_right"],
+           "McNemar p": test["p_value"]}
+    for metric, label, digits in [("balanced_accuracy", "balanced accuracy", 3), ("class_har", "per-class HAR", 1),
+                                  ("false_alarms_pct", "false alarms %", 1)]:
+        difference = final_boot[a]["boot"][metric] - final_boot[b]["boot"][metric]
+        point = final_boot[a]["point"][metric] - final_boot[b]["point"][metric]
+        low, high = np.percentile(difference, [2.5, 97.5])
+        row[f"{label}: a - b (95 %)"] = f"{point:+.{digits}f} ({low:+.{digits}f} to {high:+.{digits}f})"
+    comparison_rows.append(row)
+data["FINAL_COMPARISONS"] = pd.DataFrame(comparison_rows)
+save_table(data["FINAL_COMPARISONS"], RESULTS_DIR / "final_comparisons.csv", OVERWRITE)
+data["FINAL_COMPARISONS"].round(4)
+
+# %%
+# RQ2: light vs heavy blur, detection with 95 % intervals, for every final method
+order = list(data["FINAL_BENCHMARK"]["method"])
+fig, ax = plt.subplots(figsize=(9, 0.45 * len(order) + 1.5), constrained_layout=True)
+y = np.arange(len(order))
+for offset, label, colour in [(-0.18, "blur_light", RUN_COLOURS[2]), (0.18, "blur_heavy", RUN_COLOURS[1])]:
+    point = np.array([final_boot[m]["point"][label] for m in order])
+    low, high = np.array([np.percentile(final_boot[m]["boot"][label], [2.5, 97.5]) for m in order]).T
+    ax.barh(y + offset, point, height=0.34, color=colour, label=label.replace("_", " "))
+    ax.errorbar(point, y + offset, xerr=[point - low, high - point], fmt="none", ecolor=REFERENCE_COLOUR, lw=1, capsize=2)
+ax.set_yticks(y, order)
+ax.invert_yaxis()
+ax.set(xlabel="pictures flagged (%), 95 % interval by preparation", xlim=(0, 100),
+       title="Light vs heavy blur: detection by the final methods")
+ax.legend(frameon=False, loc="center left", bbox_to_anchor=(1.0, 0.5))
+ax.spines[["top", "right"]].set_visible(False)
+save_figure(fig, RESULTS_DIR / "final_blur_levels.png", OVERWRITE)
 plt.show()
 
 # %% [markdown]
