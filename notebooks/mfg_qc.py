@@ -25,6 +25,7 @@ os.environ["HF_HOME"] = "/home/qq/mfg_qc/data/weights/huggingface"
 os.environ["TORCH_HOME"] = "/home/qq/mfg_qc/data/weights/torch"
 
 import hashlib
+import json
 import pickle
 import re
 import shutil
@@ -33,6 +34,7 @@ from collections.abc import Iterator
 from concurrent.futures import ProcessPoolExecutor
 from datetime import datetime
 from functools import partial
+from importlib.metadata import version as package_version
 from pathlib import Path
 
 import cv2
@@ -300,6 +302,11 @@ BENCHMARK_VOTES = [(6, 1), (3, 2)]  # (n voters, k votes needed): any of the 6; 
 FINAL_VOTES = [(5, 1), (3, 2)]  # (n voters, k votes needed): any of the 5; 2 of the 3 best
 BOOTSTRAP_RESAMPLES = 2000  # 95 % intervals: the preparations (slides) drawn again this many times
 TIMING_PICTURES = 50  # pictures timed one at a time (after 3 warm-up pictures), on the GPU and on the CPU
+
+# Screening model (Experiments): the max rule trained on all data and saved, to screen new pictures later
+SCREEN_MODEL_DIR = Path("/home/qq/mfg_qc/data/models/max_rule_v1")  # git-ignored; never overwritten
+SCREEN_FOLDER = RAW_DIR / "F" / "F01"  # folder to screen (example: frozen milk F01, never trained on)
+SCREEN_SUFFIXES = (".png", ".jpg", ".jpeg", ".tif", ".tiff")  # picture files that are screened
 
 # CNNs (CLAUDE.md §9 Step 5): ImageNet networks fine-tuned with two outputs, good vs defective (T1) and
 # which label (T2). Design A: the whole picture (WHOLE_SIZE). Trained in fp32: fp16 overflows in these
@@ -2079,7 +2086,7 @@ def make_dfm() -> DFMModel:
                     n_comps=DFM_VARIANCE, score_type="fre").to(DEVICE)
 
 
-def fit_dfm(model: DFMModel, paths: list[Path], desc: str) -> None:
+def fit_dfm(model: DFMModel, paths: list[Path], desc: str, pca_on_cpu: bool = False) -> None:
     """Fit DFM on good training images: a PCA of the features of all their tiles (anomalib's own fit).
 
     Every tile becomes 9,216 numbers (its layer3 feature map averaged down to 6 x 6 cells). For ~320
@@ -2090,12 +2097,19 @@ def fit_dfm(model: DFMModel, paths: list[Path], desc: str) -> None:
         model (DFMModel): from make_dfm.
         paths (list[Path]): good training images, e.g. the ~320 good images of the two training folds.
         desc (str): label of the progress bar, e.g. "run 1: fit on 312 good images".
+        pca_on_cpu (bool): True = compute the PCA on the CPU (the features are still computed on the GPU).
+            anomalib's PCA does an SVD in double precision that needs ~1.5 GB more GPU memory for all 609 good
+            images (7,308 tiles) than the 4 GB card has; the result is the same up to rounding.
     """
     model.train()  # anomalib: in training mode the model keeps the tile features (backbone stays in eval)
     with torch.no_grad():
         for tiles in tile_batches(paths, desc):
             model(anomaly_input(tiles, model))
+        if pca_on_cpu:
+            model.memory_bank = [features.cpu() for features in model.memory_bank]
+            model.pca_model.cpu()
         model.fit()
+    model.to(DEVICE)
 
 
 def make_padim() -> PadimModel:
@@ -2663,6 +2677,250 @@ def time_per_picture(model_steps: dict, paths: list[Path], warmup: int = 3) -> p
         if i >= warmup:
             rows.append(row)
     return pd.DataFrame(rows)
+
+
+def screening_parts(criterion: pd.DataFrame, family: pd.Series) -> tuple[str, str]:
+    """Return the two members of the screening max rule, chosen on non-test data only.
+
+    The supervised member (handcrafted or deep features) and the anomaly member (DFM or PatchCore) with the
+    highest criterion (choice_score) averaged over the 4 runs. The screening code supports DINOv2
+    whole-picture models and DFM, the members the runs chose.
+
+    Args:
+        criterion (pd.DataFrame): final_criterion (index = method, columns = runs).
+        family (pd.Series): index = method, its family (candidate_family).
+
+    Returns:
+        tuple[str, str]: e.g. ("dinov2_vits14 Logistic regression | whole", "DFM resnet18 | tiles mean").
+
+    Raises:
+        NotImplementedError: if the chosen members are not a DINOv2 whole-picture model and DFM.
+    """
+    mean = criterion.mean(axis=1)
+    supervised = mean[family.isin(["handcrafted supervised", "deep supervised"])].idxmax()
+    anomaly = mean[family == "anomaly detection"].idxmax()
+    if not (supervised.startswith("dinov2_vits14 ") and supervised.endswith("| whole") and anomaly.startswith("DFM")):
+        raise NotImplementedError(f"screening supports DINOv2 whole-picture models and DFM, not {supervised} / {anomaly}")
+    return supervised, anomaly
+
+
+def fit_screening_models(whole: pd.DataFrame, info: pd.DataFrame, paths: pd.Series, supervised_name: str,
+                         folds: list[int], good_limit: int | None = None) -> tuple:
+    """Fit the two members of the screening max rule on the pictures of some folds.
+
+    Args:
+        whole (pd.DataFrame): DINOv2 whole-picture features (column "file" + 768 features), from deep_feature_tables.
+        info (pd.DataFrame): index = file, columns fold, label, is_defect.
+        paths (pd.Series): index = file, the image path.
+        supervised_name (str): a key of SUPERVISED_MODELS, e.g. "Logistic regression".
+        folds (list[int]): the folds to learn from, e.g. [1, 2, 3, 4] (final model) or [2, 3, 4].
+        good_limit (int | None): use only the first N good pictures for DFM (quick checks); None = all.
+
+    Returns:
+        tuple: the fitted classifier (all pictures of the folds) and the fitted DFM model (their good pictures).
+    """
+    feature_cols = [c for c in whole.columns if c != "file"]
+    rows = whole["file"].map(info["fold"]).isin(folds).to_numpy()
+    y = whole["file"].map(info["is_defect"]).astype(int).to_numpy()
+    classifier = SUPERVISED_MODELS[supervised_name]()
+    classifier.fit(whole[feature_cols].to_numpy(float)[rows], y[rows])
+    good = sorted(info.index[info["fold"].isin(folds) & (info["label"] == "good")])[:good_limit]
+    dfm = make_dfm()
+    fit_dfm(dfm, [Path(paths[f]) for f in good], f"DFM on folds {folds}: fit on {len(good)} good images",
+            pca_on_cpu=True)  # the PCA of up to 609 good images does not fit into 4 GB of GPU memory
+    return classifier, dfm
+
+
+def build_screening_model(whole: pd.DataFrame, info: pd.DataFrame, paths: pd.Series, supervised: str,
+                          anomaly: str, good_limit: int | None = None) -> dict:
+    """Build the screening max rule: final models on all 4 folds and the reference scores that set the cut.
+
+    The cut must come from good pictures scored by models that did not see them. So every fold's good pictures
+    are scored by models trained on the other 3 folds (almost as large as the final model, which uses all 4).
+    A new picture is then judged exactly as in the evaluation: its two scores become unusualness values
+    (percentiles among these reference scores), the higher of the two is taken, and the picture is flagged if
+    that is above FLAG_PERCENTILE of the reference pictures' own combined values.
+
+    Args:
+        whole (pd.DataFrame): DINOv2 whole-picture features, from deep_feature_tables.
+        info (pd.DataFrame): index = file, columns fold, label, is_defect (A-D pictures are used).
+        paths (pd.Series): index = file, the image path.
+        supervised (str): e.g. "dinov2_vits14 Logistic regression | whole" (from screening_parts).
+        anomaly (str): e.g. "DFM resnet18 | tiles mean".
+        good_limit (int | None): fewer good pictures per DFM fit and per fold (quick checks only); None = all.
+
+    Returns:
+        dict: "classifier", "dfm" (the final models), "reference" (pd.DataFrame: file, fold, supervised =
+            P(defective), tile_0-tile_11 = DFM tile scores, dfm = their mean or max) and "settings" (dict).
+    """
+    supervised_name = supervised.split(" | ")[0].removeprefix("dinov2_vits14 ")
+    agg = anomaly.split(" | tiles ")[1]  # "mean" or "max"
+    feature_cols = [c for c in whole.columns if c != "file"]
+    features = whole.set_index("file")[feature_cols]
+    reference = []
+    for fold in FOLDS:
+        classifier, dfm = fit_screening_models(whole, info, paths, supervised_name,
+                                               [f for f in FOLDS if f != fold], good_limit)
+        good = sorted(info.index[(info["fold"] == fold) & (info["label"] == "good")])[:good_limit]
+        tiles = anomaly_tile_scores(dfm, [Path(paths[f]) for f in good], f"fold {fold}: reference scores")
+        reference.append(pd.DataFrame({
+            "file": good, "fold": fold,
+            "supervised": classifier.predict_proba(features.loc[good].to_numpy(float))[:, 1],
+            **{f"tile_{i}": tiles[:, i] for i in range(tiles.shape[1])}}))
+        del dfm
+        torch.cuda.empty_cache()
+    reference = pd.concat(reference, ignore_index=True)
+    reference["dfm"] = reference[[f"tile_{i}" for i in range(12)]].agg(agg, axis=1)
+    classifier, dfm = fit_screening_models(whole, info, paths, supervised_name, list(FOLDS), good_limit)
+    settings = {
+        "supervised": supervised, "anomaly": anomaly, "dinov2": DEEP_BACKBONES["dinov2_vits14"],
+        "dfm_backbone": DFM_BACKBONE, "dfm_layer": DFM_LAYER, "dfm_pooling": DFM_POOLING,
+        "dfm_variance": DFM_VARIANCE, "roi": list(ROI), "whole_size": list(WHOLE_SIZE), "tile": CROP_SIZE,
+        "flag_percentile": FLAG_PERCENTILE, "data_key": data.get("KEY"),
+        "trained_on": {"pictures": int(info["fold"].notna().sum()),
+                       "good_pictures": int((info["fold"].notna() & (info["label"] == "good")).sum())},
+        "reference_pictures": len(reference), "good_limit": good_limit,
+        "created": datetime.now().isoformat(timespec="seconds"),
+        "versions": {p: package_version(p) for p in ["torch", "timm", "anomalib", "scikit-learn", "numpy"]},
+    }
+    return {"classifier": classifier, "dfm": dfm, "reference": reference, "settings": settings}
+
+
+def save_screening_model(model: dict, out_dir: Path, overwrite: bool) -> None:
+    """Save the screening model to a folder: supervised.pkl, dfm.pt, reference.csv, settings.json.
+
+    Args:
+        model (dict): from build_screening_model (or recalibrate_screening).
+        out_dir (Path): e.g. SCREEN_MODEL_DIR.
+        overwrite (bool): True = replace an existing model in that folder (e.g. OVERWRITE).
+
+    Raises:
+        FileExistsError: if the folder already holds a model and overwrite is False.
+    """
+    if (out_dir / "settings.json").exists() and not overwrite:
+        raise FileExistsError(f"A screening model is already saved in {out_dir} (set OVERWRITE = True to replace)")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    with open(out_dir / "supervised.pkl", "wb") as f:
+        pickle.dump(model["classifier"], f)
+    torch.save(model["dfm"].state_dict(), out_dir / "dfm.pt")
+    model["reference"].to_csv(out_dir / "reference.csv", index=False)
+    (out_dir / "settings.json").write_text(json.dumps(model["settings"], indent=2))
+    print(f"Saved the screening model in {out_dir}")
+
+
+def load_screening_model(model_dir: Path) -> dict:
+    """Load a saved screening model, ready for screen_pictures (networks on DEVICE).
+
+    Args:
+        model_dir (Path): e.g. SCREEN_MODEL_DIR.
+
+    Returns:
+        dict: "backbone" (DINOv2), "classifier", "dfm", "reference", "settings".
+    """
+    settings = json.loads((model_dir / "settings.json").read_text())
+    with open(model_dir / "supervised.pkl", "rb") as f:
+        classifier = pickle.load(f)
+    dfm = make_dfm()
+    dfm.load_state_dict(torch.load(model_dir / "dfm.pt", map_location=DEVICE))
+    return {"backbone": make_backbone(settings["dinov2"]), "classifier": classifier, "dfm": dfm.eval(),
+            "reference": pd.read_csv(model_dir / "reference.csv"), "settings": settings}
+
+
+def screen_pictures(model: dict, paths: list[Path]) -> pd.DataFrame:
+    """Screen pictures with the saved max rule: a score (0-100), the decision, and where it looks defective.
+
+    For every picture: P(defective) from DINOv2 + the classifier, and the 12 DFM tile scores (their mean or
+    max = the DFM score). Both become unusualness values among the reference good pictures; the higher one is
+    the combined value, and the score is its percentile among the reference pictures' combined values.
+    Flagged if the score is above FLAG_PERCENTILE.
+
+    Args:
+        model (dict): from load_screening_model.
+        paths (list[Path]): pictures to screen, 2048 x 1536 px from the same setup (same camera, objective,
+            light; otherwise recalibrate first, see recalibrate_screening).
+
+    Returns:
+        pd.DataFrame: one row per picture: file, path, score, flagged, p_defect, u_supervised, dfm_score,
+            u_dfm, most_unusual_tile (0-11, row by row from the top left), tile_percentile (that tile among
+            all reference good tiles), tile_0-tile_11.
+
+    Raises:
+        ValueError: if a picture is smaller than the ROI (another camera or resolution).
+    """
+    ref = model["reference"]
+    agg = np.mean if model["settings"]["anomaly"].endswith("mean") else np.max
+    ref_sup, ref_dfm = ref["supervised"].to_numpy(), ref["dfm"].to_numpy()
+    ref_combined = np.maximum(unusualness(ref_sup, ref_sup, False), unusualness(ref_dfm, ref_dfm, False))
+    ref_tiles = ref[[f"tile_{i}" for i in range(12)]].to_numpy().ravel()
+    rows = []
+    for path in tqdm(paths, desc="screening", unit="picture"):
+        roi_img = load_roi(path, ROI)
+        if roi_img.shape != (ROI[3] - ROI[1], ROI[2] - ROI[0], 3):
+            raise ValueError(f"{path.name}: ROI {roi_img.shape[:2]}, expected {(ROI[3] - ROI[1], ROI[2] - ROI[0])} "
+                             "(pictures must be 2048 x 1536 px)")
+        p_defect = picture_score_dinov2(model["backbone"], model["classifier"], roi_img)
+        tiles = picture_tile_scores_dfm(model["dfm"], roi_img)
+        dfm_score = float(agg(tiles))
+        u_sup = float(unusualness([p_defect], ref_sup, False)[0])
+        u_dfm = float(unusualness([dfm_score], ref_dfm, False)[0])
+        score = float(unusualness([max(u_sup, u_dfm)], ref_combined, False)[0])
+        worst = int(np.argmax(tiles))
+        rows.append({"file": path.name, "path": str(path), "score": score, "flagged": score > FLAG_PERCENTILE,
+                     "p_defect": p_defect, "u_supervised": u_sup, "dfm_score": dfm_score, "u_dfm": u_dfm,
+                     "most_unusual_tile": worst, "tile_percentile": float(unusualness([tiles[worst]], ref_tiles, False)[0]),
+                     **{f"tile_{i}": float(t) for i, t in enumerate(tiles)}})
+    return pd.DataFrame(rows)
+
+
+def recalibrate_screening(model: dict, good_paths: list[Path]) -> dict:
+    """Return a copy of the screening model whose cut comes from new good pictures (e.g. a new camera or lamp).
+
+    The models stay the same; only the reference changes: the new good pictures are scored and become the
+    reference, so about 5 % of good pictures from the new setup are flagged. About 100 pictures that an expert
+    judged good are enough. Save the result in a NEW folder with save_screening_model.
+
+    Args:
+        model (dict): from load_screening_model.
+        good_paths (list[Path]): good pictures from the new setup.
+
+    Returns:
+        dict: the same models with the new reference and settings["recalibrated"] filled in.
+    """
+    scores = screen_pictures(model, good_paths)
+    reference = pd.DataFrame({"file": scores["file"], "fold": np.nan, "supervised": scores["p_defect"],
+                              **{f"tile_{i}": scores[f"tile_{i}"] for i in range(12)}, "dfm": scores["dfm_score"]})
+    settings = {**model["settings"], "recalibrated": {"pictures": len(good_paths),
+                                                      "date": datetime.now().isoformat(timespec="seconds")}}
+    return {**model, "reference": reference, "settings": settings}
+
+
+def plot_screening_sheet(results: pd.DataFrame, title: str, n: int = 24) -> plt.Figure:
+    """Show the flagged pictures with the highest scores, the most unusual tile framed.
+
+    Args:
+        results (pd.DataFrame): from screen_pictures.
+        title (str): figure title.
+        n (int): at most this many pictures, e.g. 24.
+
+    Returns:
+        plt.Figure: 6 pictures per row (the ROI shrunk to 768 x 576), title = file and score; red frame = the
+            tile DFM finds most unusual.
+    """
+    shown = results[results["flagged"]].sort_values("score", ascending=False).head(n)
+    n_rows = max(1, int(np.ceil(len(shown) / 6)))
+    fig, axes = plt.subplots(n_rows, 6, figsize=(24, 3.3 * n_rows), constrained_layout=True, squeeze=False)
+    for ax in axes.ravel():
+        ax.axis("off")
+    for ax, (_, r) in zip(axes.ravel(), shown.iterrows()):
+        ax.imshow(shrink_roi(load_roi(Path(r["path"]), ROI), WHOLE_SIZE))
+        size = WHOLE_SIZE[1] / 3  # tile side in the shown picture
+        row, col = divmod(int(r["most_unusual_tile"]), 4)
+        ax.add_patch(Rectangle((col * size, row * size), size, size, fill=False, edgecolor=FLAG_COLOUR, lw=3))
+        ax.set_title(f"{r['file']}: score {r['score']:.1f}", fontsize=10)
+    if shown.empty:
+        axes[0, 0].text(0, 0.5, "No picture flagged", fontsize=14)
+    fig.suptitle(title, fontsize=13)
+    return fig
 
 
 def out_of_fold_scores(scores: pd.DataFrame, extra: dict, info: pd.DataFrame) -> pd.DataFrame:
@@ -5476,3 +5734,49 @@ pd.concat([final_one_class, pyod_summary]).sort_values("auroc", ascending=False)
 fig = plot_detection_heatmap(pyod_summary, eval_labels,
                              "Experiment: PyOD one-class detectors on handcrafted and deep features")
 plt.show()
+
+# %% [markdown]
+# ## Screening model (max rule)
+#
+# The max rule packed for screening new pictures later (not for the paper's numbers, which come from the
+# 4 runs above). It is built exactly like the evaluated max rule, now from all data:
+# - **Members**, chosen on non-test data: the supervised method and the anomaly model with the highest criterion
+#   averaged over the 4 runs (`screening_parts`).
+# - **Final models** trained on all 4 folds: the classifier on the DINOv2 features of all A-D pictures, DFM on the
+#   12 tiles of all good pictures.
+# - **The cut**: every fold's good pictures are scored by models trained on the other 3 folds (they never saw
+#   them); these reference scores set the cut at the 95th percentile, as in the evaluation.
+#
+# Saved once in `SCREEN_MODEL_DIR` (data/models, git-ignored; about 9 min of GPU the first time) and loaded
+# afterwards. To screen a folder, set `SCREEN_FOLDER` in Config and run the screening cell: it writes a CSV (one row
+# per picture: score 0-100, flagged, which tile looks most unusual) and shows the flagged pictures.
+#
+# **When the setup changes** (camera, lamp, microscope, stain batch, milk type), the cut must be set again from
+# about 100 pictures that an expert judged good: `recalibrate_screening(screening_model, good_paths)`, then
+# `save_screening_model(..., new folder, False)`. The models stay the same; only the reference changes.
+
+# %%
+# Build the screening model (once; saved) or load it
+if (SCREEN_MODEL_DIR / "settings.json").exists() and USE_SAVED_RESULTS:
+    print(f"Loading the saved screening model from {SCREEN_MODEL_DIR}")
+else:
+    screen_supervised, screen_anomaly = screening_parts(final_criterion, candidate_family)
+    print(f"Members chosen on non-test data: {screen_supervised} + {screen_anomaly}")
+    dinov2_whole, _ = deep_feature_tables(deep_features["dinov2_vits14"])
+    save_screening_model(build_screening_model(dinov2_whole, eval_info, image_paths, screen_supervised,
+                                               screen_anomaly), SCREEN_MODEL_DIR, OVERWRITE)
+screening_model = load_screening_model(SCREEN_MODEL_DIR)
+print(json.dumps({k: screening_model["settings"][k] for k in ["supervised", "anomaly", "trained_on",
+                                                              "reference_pictures", "created"]}, indent=1))
+
+# %%
+# Screen a folder: one row per picture, and the flagged pictures with their most unusual tile framed
+screen_paths = sorted(p for p in SCREEN_FOLDER.rglob("*") if p.suffix.lower() in SCREEN_SUFFIXES)
+screen_results = screen_pictures(screening_model, screen_paths)
+save_table(screen_results, RESULTS_DIR / f"screening_{SCREEN_FOLDER.name}.csv", OVERWRITE)
+print(f"{SCREEN_FOLDER}: {int(screen_results['flagged'].sum())} of {len(screen_results)} pictures flagged")
+fig = plot_screening_sheet(screen_results, f"Screening {SCREEN_FOLDER.name}: flagged pictures with the highest scores "
+                                           "(red frame = most unusual tile)")
+save_figure(fig, RESULTS_DIR / f"screening_{SCREEN_FOLDER.name}.png", OVERWRITE)
+plt.show()
+screen_results[["file", "score", "flagged", "p_defect", "u_supervised", "dfm_score", "u_dfm", "most_unusual_tile"]].round(3)
