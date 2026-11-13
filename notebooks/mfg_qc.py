@@ -291,6 +291,10 @@ VOTERS = [  # voting: the best method of each family, each decides on its own (u
 ]
 VOTES_NEEDED = [1, 2, 3, 4, 5]  # flag an image if at least this many voters flag it (3 = majority)
 
+# Benchmark: the best method of each of the 6 families by balanced accuracy; the n best of them vote, and
+# an image is flagged if at least k of them flag it
+BENCHMARK_VOTES = [(6, 1), (3, 2)]  # (n voters, k votes needed): any of the 6; 2 of the 3 best
+
 # CNNs (CLAUDE.md §9 Step 5): ImageNet networks fine-tuned with two outputs, good vs defective (T1) and
 # which label (T2). Design A: the whole picture (WHOLE_SIZE). Trained in fp32: fp16 overflows in these
 # networks (NaN) and was 4x slower on the GTX 1650 (speed test: 22.5 training images/s, 1.75 GB GPU).
@@ -4071,6 +4075,57 @@ families = [("handcrafted one-class", data["ONE_CLASS"]), ("handcrafted supervis
 pd.concat([
     table.sort_values("auroc", ascending=False).head(1).assign(family=family) for family, table in families
 ]).set_index("family")[["method", "auroc", "balanced_accuracy", "har", "false_alarms_pct"] + eval_labels[1:]].round(2)
+
+# %% [markdown]
+# # Benchmark
+#
+# One table of all methods, chosen and ranked by **balanced accuracy**: the mean of the detection rate on
+# defective pictures and the pass rate on good pictures, at the cut each method really uses (95th percentile
+# of the good validation pictures). AUROC says how well a score could separate good from defective with the
+# best possible cut; balanced accuracy says how well the method does as a QC with its actual cut.
+# Example: ResNet-50 has the higher AUROC (0.96 vs 0.95), ResNet-18 the higher balanced accuracy (0.90 vs
+# 0.86, with fewer false alarms and more bubbles, undiluted and frozen milk caught).
+# - **Best of each family**: the method with the highest balanced accuracy in each of the 6 families
+#   (handcrafted one-class, handcrafted supervised, deep one-class, deep supervised, anomaly detection, CNN).
+# - **Votes of the best** (`BENCHMARK_VOTES`): the n family bests with the highest balanced accuracy each
+#   decide on their own (unusualness > 95); an image is flagged if at least k of them flag it.
+#   "At least 1 of 6": any of the 6 is enough. "At least 2 of 3": 2 of the 3 best must agree.
+# - **Combined**: the best of the earlier combinations (max rule, votes of 5), also by balanced accuracy.
+#
+# The voters are chosen by their results on the test folds, so the votes are slightly optimistic.
+
+# %%
+# Best method of each family by balanced accuracy, and the votes of the best of them
+for name in CNN_BACKBONES:  # CNN image scores (P(defective)), so the CNNs can vote too
+    method_scores[f"CNN {name} | whole"] = pd.DataFrame(
+        {run: cnn_runs[(name, run)]["scores"]["p_defect"] for run in FOLDS})
+families = [("handcrafted one-class", data["ONE_CLASS"]), ("handcrafted supervised", data["SUPERVISED"])] + [
+    (family, table) for family, table in data["DEEP"].groupby("family")
+] + [("anomaly detection", data["ANOMALY_ALL"]), ("CNN", data["CNN"])]
+family_best = pd.concat([
+    table.sort_values("balanced_accuracy", ascending=False).head(1).assign(family=family) for family, table in families
+]).sort_values("balanced_accuracy", ascending=False)
+ranked_best = family_best["method"].tolist()  # the 6 family bests, highest balanced accuracy first
+
+unusual_best = {method: run_unusualness(method_scores[method], eval_info) for method in ranked_best}
+benchmark_results = {}  # method name -> (metrics per run, predictions)
+for n, k in BENCHMARK_VOTES:
+    flags = sum((unusual_best[method] > FLAG_PERCENTILE).astype(float).where(unusual_best[method].notna())
+                for method in ranked_best[:n])
+    benchmark_results[f"vote: at least {k} of {n} best"] = evaluate_method(flags, eval_info, two_sided=False,
+                                                                          cut=k - 0.5)
+    print(f"At least {k} of {n} best:", ", ".join(ranked_best[:n]))
+
+combined_best = data["COMBINED"].loc[data["COMBINED"]["combination"] != "alone"].sort_values(
+    "balanced_accuracy", ascending=False).head(1).assign(family="combined")
+votes_best = pd.DataFrame([{"family": "votes of the best", **summary_row(method, *result, eval_labels)}
+                           for method, result in benchmark_results.items()])
+benchmark_columns = ["family", "method", "auroc", "auroc_sd", "balanced_accuracy", "har", "false_alarms_pct",
+                     "false_alarms_sd_pct"] + eval_labels[1:]
+data["BENCHMARK"] = pd.concat([family_best, combined_best, votes_best])[benchmark_columns].sort_values(
+    "balanced_accuracy", ascending=False)
+save_table(data["BENCHMARK"].round(4), RESULTS_DIR / "benchmark_summary.csv", OVERWRITE)
+data["BENCHMARK"].set_index("method").round(2)
 
 # %% [markdown]
 # # Experiments
