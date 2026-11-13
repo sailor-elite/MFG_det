@@ -2165,6 +2165,61 @@ def run_anomaly_model(info: pd.DataFrame, paths: pd.Series, run: int, make_model
     return pd.DataFrame(tile_scores, index=scored)
 
 
+def final_anomaly_scores(name: str, info: pd.DataFrame, paths: pd.Series, target: int | tuple[int, int],
+                         bank: np.ndarray | None = None, n_check: int = 4) -> pd.DataFrame:
+    """Score the pictures the final evaluation still needs from DFM or PatchCore (tile scores).
+
+    target = a run (int): the run's own model, fitted on the good pictures of its training folds as in the
+        sections above (DFM is fitted again, the same way; PatchCore uses its saved memory bank), scores the
+        defective pictures of the validation fold, never scored before (needed to choose methods on
+        non-test data), plus n_check good validation pictures it scored before (to check that the model is
+        the same: their new scores must equal the saved ones).
+    target = a fold pair (tuple): a new model, fitted on the good pictures of these two folds, scores all
+        pictures (good and defective) of the other two folds: the out-of-fold scores of training folds.
+        PatchCore's memory bank uses the seed SEED + 10 * a + b, e.g. 13 for folds 1 + 3.
+
+    Args:
+        name (str): "DFM" or "PatchCore".
+        info (pd.DataFrame): index = file, columns fold, label (images that are not excluded), e.g. eval_info.
+        paths (pd.Series): index = file, the image path, e.g. image_paths.
+        target (int | tuple[int, int]): a run (1-4) or a fold pair, e.g. (1, 3).
+        bank (np.ndarray | None): PatchCore only, for a run: its saved memory bank (patchcore_runs[run]["bank"]).
+        n_check (int): good validation pictures scored again for the check (runs only), e.g. 4.
+
+    Returns:
+        pd.DataFrame: index = file of the scored pictures, columns 0-11 = tile score (tile_idx).
+
+    Raises:
+        ValueError: if name is not "DFM" or "PatchCore".
+    """
+    if name not in ("DFM", "PatchCore"):
+        raise ValueError(f"name must be 'DFM' or 'PatchCore', got {name}")
+    good = info["label"] == "good"
+    if isinstance(target, int):
+        roles = run_roles(info["fold"], target)
+        train = info.index[(roles == "train") & good]
+        scored = (info.index[(roles == "validation") & ~good].tolist()
+                  + sorted(info.index[(roles == "validation") & good])[:n_check])
+        seed, label = SEED + target, f"run {target}"
+    else:
+        in_pair = info["fold"].isin(target)
+        train = info.index[in_pair & good]
+        scored = info.index[~in_pair & info["fold"].notna()].tolist()
+        seed, label = SEED + 10 * target[0] + target[1], f"folds {target[0]} + {target[1]}"
+    train_paths, scored_paths = [Path(paths[f]) for f in train], [Path(paths[f]) for f in scored]
+    if name == "DFM":
+        model = make_dfm()
+        fit_dfm(model, train_paths, f"DFM {label}: fit on {len(train)} good images")
+    else:
+        model = make_patchcore()
+        model.memory_bank = (torch.from_numpy(bank).to(DEVICE) if bank is not None else patchcore_memory_bank(
+            model, train_paths, seed, f"PatchCore {label}: memory bank from {len(train)} good images"))
+    tile_scores = anomaly_tile_scores(model, scored_paths, f"{name} {label}: scoring {len(scored)} images")
+    del model
+    torch.cuda.empty_cache()
+    return pd.DataFrame(tile_scores, index=scored)
+
+
 def patchcore_map(model: PatchcoreModel, path: Path) -> tuple[np.ndarray, np.ndarray]:
     """Return the anomaly map of one image: the patch distances of its 12 tiles, put back into the ROI.
 
@@ -2344,21 +2399,23 @@ def out_of_fold_scores(scores: pd.DataFrame, extra: dict, info: pd.DataFrame) ->
     2 + 3 (= run 4's model). Test, validation and test-only pictures keep the run's own scores.
 
     Args:
-        scores (pd.DataFrame): index = file, columns = runs 1-4: the method's own scores (all pictures).
+        scores (pd.DataFrame): index = file, columns = runs 1-4: the method's own scores (scikit-learn:
+            all pictures; anomaly models: at least the test, test-only and validation pictures).
         extra (dict): {pair: image scores (pd.Series)} for the pairs no run trains on, from run_extra_pairs.
         info (pd.DataFrame): index = file, column fold.
 
     Returns:
-        pd.DataFrame: same shape as scores, with the training pictures' scores replaced.
+        pd.DataFrame: index = info.index, columns = runs: the run's own scores, with the training pictures'
+            scores replaced (or filled in, where the run's model did not score them).
     """
     by_pair = {tuple(sorted(train_folds(run))): scores[run] for run in scores.columns}
     by_pair.update(extra)
     out = {}
     for run in scores.columns:
-        s = scores[run].copy()
+        s = scores[run].reindex(info.index)
         for j in train_folds(run):
             other = [f for f in train_folds(run) if f != j][0]
-            rows = info.index[info["fold"] == j].intersection(s.index)
+            rows = info.index[info["fold"] == j]
             s.loc[rows] = by_pair[tuple(sorted((other, VALIDATION_FOLD[run])))].reindex(rows).to_numpy()
         out[run] = s
     return pd.DataFrame(out)
@@ -4741,6 +4798,72 @@ threshold_check = pd.DataFrame(threshold_rows, index=[f"run {run}: training fold
 threshold_check.loc["all good pictures (used)"] = [len(good_paths), data["GLOBULE_THRESHOLD"],
                                                    data["GLOBULE_THRESHOLD_WHOLE"]]
 threshold_check.round(2)
+
+# %% [markdown]
+# ## Anomaly models (DFM, PatchCore): scores of the non-test pictures
+#
+# The sections above let DFM and PatchCore score only what the old evaluation needed: the test fold, the
+# other milks and the good validation pictures. For the 12-slide cut and the choice on non-test data they
+# also need:
+# - **the defective validation pictures**, scored by each run's own model (DFM fitted again the same way,
+#   PatchCore with its saved memory bank). Four good validation pictures per run are scored again as a
+#   check: their scores must equal the saved ones;
+# - **the training folds**, scored by models that never saw them. As for the scikit-learn methods, the runs'
+#   own models cover four fold pairs (their test folds); two new models per method cover the pairs 1 + 3 and
+#   2 + 4 (fitted on the good pictures of the pair, scoring all pictures of the other two folds).
+#
+# GPU, about 1 hour the first time (DFM ~20 min, PatchCore ~35 min; saved afterwards). PaDiM is not carried on
+# (see above).
+
+# %%
+# Score the pictures still needed: defective validation pictures (runs' own models) and the extra fold pairs
+final_anomaly_tiles = {}  # (name, run or pair) -> tile scores of the newly scored pictures
+for name in ["DFM", "PatchCore"]:
+    for target in list(FOLDS) + extra_pairs:
+        label = f"run{target}" if isinstance(target, int) else f"folds{target[0]}{target[1]}"
+        bank = patchcore_runs[target]["bank"] if (name == "PatchCore" and isinstance(target, int)) else None
+        final_anomaly_tiles[(name, target)] = load_or_compute(
+            CACHE_DIR / f"final_{name.lower()}_{label}_{data['KEY']}.pkl",
+            lambda: final_anomaly_scores(name, eval_info, image_paths, target, bank), USE_SAVED_RESULTS)
+
+# Check: the runs' own models give the saved scores again (good validation pictures scored twice)
+saved_tiles = {("DFM", run): anomaly_tile_tables[("DFM", run)] for run in FOLDS}
+saved_tiles.update({("PatchCore", run): patchcore_runs[run]["tile_scores"] for run in FOLDS})
+for (name, run), saved in saved_tiles.items():
+    new = final_anomaly_tiles[(name, run)]
+    common = new.index.intersection(saved.index)
+    largest = float((new.loc[common] - saved.loc[common]).abs().to_numpy().max())
+    print(f"{name} run {run}: {len(common)} pictures scored again, largest difference {largest:.2e} "
+          f"(scores up to {float(saved.loc[common].abs().to_numpy().max()):.3g})")
+
+# %%
+# DFM and PatchCore with the 12-slide cut (tiles max and tiles mean), next to the 4-slide cut
+anomaly_rows = []
+for name, saved_name in [("DFM", f"DFM {DFM_BACKBONE.split('.')[0]}"), ("PatchCore", f"PatchCore {patchcore_name}")]:
+    own_tiles = {}
+    for run in FOLDS:  # saved scores + the newly scored pictures (the check pictures keep their saved scores)
+        both = pd.concat([saved_tiles[(name, run)], final_anomaly_tiles[(name, run)]])
+        own_tiles[run] = both[~both.index.duplicated()]
+    for agg in ("max", "mean"):
+        method = f"{saved_name} | tiles {agg}"
+        own = pd.DataFrame({run: t.agg(agg, axis=1) for run, t in own_tiles.items()})
+        extra = {pair: final_anomaly_tiles[(name, pair)].agg(agg, axis=1) for pair in extra_pairs}
+        final_scores[method] = out_of_fold_scores(own, extra, eval_info)
+        final_families[method] = "anomaly detection"
+        final_results[method] = evaluate_method(final_scores[method], eval_info, two_sided=False,
+                                                reference="non-test")
+        four = summary_row(method, *evaluate_method(method_scores[method], eval_info, two_sided=False), eval_labels)
+        twelve = summary_row(method, *final_results[method], eval_labels)
+        anomaly_rows.append({
+            "method": method, "family": "anomaly detection",
+            "false_alarms_4": four["false_alarms_pct"], "false_alarms_sd_4": four["false_alarms_sd_pct"],
+            "false_alarms_12": twelve["false_alarms_pct"], "false_alarms_sd_12": twelve["false_alarms_sd_pct"],
+            "balanced_accuracy_4": four["balanced_accuracy"], "balanced_accuracy_12": twelve["balanced_accuracy"],
+            "har_4": four["har"], "har_12": twelve["har"], "frozen_4": four["frozen"], "frozen_12": twelve["frozen"],
+        })
+data["FINAL_ANOMALY"] = pd.DataFrame(anomaly_rows).set_index("method")
+save_table(data["FINAL_ANOMALY"].reset_index().round(4), RESULTS_DIR / "final_anomaly_4_vs_12_slides.csv", OVERWRITE)
+data["FINAL_ANOMALY"].round(3)
 
 # %% [markdown]
 # # Experiments
