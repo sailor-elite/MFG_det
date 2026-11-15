@@ -8,7 +8,7 @@
 #       format_version: '1.3'
 #       jupytext_version: 1.19.6
 #   kernelspec:
-#     display_name: mfg-qc (3.11.18)
+#     display_name: Python 3 (ipykernel)
 #     language: python
 #     name: python3
 # ---
@@ -66,7 +66,7 @@ from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 # %%
-RAW_DIR = Path("/home/qq/Pictures/MFG_det")  # raw micrographs, READ ONLY
+RAW_DIR = Path("/home/qq/Pictures/MFG_det")  # raw micrographs
 # 3.2 % fresh milk, taken 11 Nov 2026: sub-folders M01-M03 (undiluted), M04_diluted, M05_diluted;
 # JPG files named only by number (e.g. 0244.jpg), the preparation comes from the folder name
 EXTRA_DIR = Path("/home/qq/mfg_qc/data/MFG/3-2_fresh_milk")
@@ -74,14 +74,13 @@ MFG_DIR = Path("/home/qq/mfg_qc/data/MFG")    # copies of the raw images, one fo
 EXCLUDED_CSV = Path("/home/qq/mfg_qc/data/excluded_images.csv")  # images removed for bad quality
 MANIFEST_CSV = Path("/home/qq/mfg_qc/data/manifest.csv")  # one row per raw image (labels, preps, folds)
 RESULTS_DIR = Path("/home/qq/mfg_qc/results")  # figures and tables (also for the paper)
-OVERWRITE = False  # False = never overwrite files that already exist in RESULTS_DIR
+OVERWRITE = True  # False = never overwrite files that already exist in RESULTS_DIR
 USE_SAVED_RESULTS = True  # True: slow cells load their saved results (compute only what is not saved yet);
                           # False: recompute all slow cells and replace their saved results
                           # (set False after changing the data or settings, e.g. new exclusions)
 CACHE_DIR = Path("/home/qq/mfg_qc/data/cache")  # saved results of slow cells (git-ignored)
 SEED = 0           # random seed for everything
 
-# ROI (CLAUDE.md §9 Step 1) and tiles (Step 2)
 SHARP_TILE = 64            # px, cell size of the sharpness map (2048 x 1536 frame -> 32 x 24 cells)
 ROI_THRESHOLD = 0.8        # sharp area = at least 80 % of the sharpness in the frame centre
 CROP_SIZE = 384            # px, side of one tile
@@ -118,7 +117,7 @@ HIST_TYPES = [  # histogram features: (column prefix, title, x-axis label, bin e
     ("hist_lbp", "LBP texture codes", "uniform LBP code", np.arange(11) - 0.5),
 ]
 
-# Image number -> label for A preparations (CLAUDE.md §7.2): (last image number, label)
+# Image number -> label for A preparations: (last image number, label)
 LABELS_A = [
     (40, "good"),
     (60, "blur_light"),
@@ -145,7 +144,7 @@ LABELS_BY_PREP = {
     "M04": "milk32", "M05": "milk32",                                                 # 3.5 ml water
 }
 
-# Label -> label group (CLAUDE.md §7.2); frozen, uht and 3.2 % milk: other milk type (counted as defective)
+# Label -> label grou; frozen, uht and 3.2 % milk: other milk type (counted as defective)
 LABEL_GROUPS = {
     "good": "good",
     "blur_light": "acquisition",
@@ -163,14 +162,14 @@ LABEL_GROUPS = {
     "milk32": "other_milk",
 }
 
-# Expected number of raw images per label (CLAUDE.md §7.3; 3.2 % milk: the number of files taken)
+# Expected number of raw images per label (3.2 % milk: the number of files taken)
 EXPECTED_COUNTS = {
     "good": 640, "blur_light": 320, "blur_heavy": 320, "filter_yellow": 320, "filter_blue": 320,
     "bubbles": 320, "corner": 320, "overstained": 320, "undiluted": 320, "overdiluted": 320,
     "frozen": 240, "uht": 240, "milk32_undiluted": 366, "milk32": 239,
 }
 
-# Preparation log (CLAUDE.md §7.4, same as Dziennik_pomiary.xlsx):
+# Preparation log (same as Dziennik_pomiary.xlsx):
 # prep -> (distilled water [ml], milk type, day, preparation time, start of imaging)
 # U01-U03: the log says "any day"; the file times show 2026-11-01.
 PREP_LOG = {
@@ -216,7 +215,7 @@ PREP_LOG = {
     "M05": (3.5, "fresh 3.2%", "2026-11-11", "13:20", "13:24"),
 }
 
-# Fixed folds (CLAUDE.md §9 Step 6). F, U and M are not in any fold: they are test only.
+# Fixed folds. F, U and M are not in any fold: they are test only.
 FOLDS = {
     1: ["A01", "A02", "A03", "A13", "B01", "C01", "D01"],
     2: ["A04", "A05", "A06", "A16", "B02", "C02", "D02"],
@@ -230,7 +229,7 @@ TEST_ONLY_LABELS = ["frozen", "uht", "milk32_undiluted", "milk32"]  # other milk
 FLAG_PERCENTILE = 95  # flag an image when it is more unusual than 95 % of good validation images
 RUN_COLOURS = {1: "#2a78d6", 2: "#eb6834", 3: "#1baf7a", 4: "#eda100"}  # one colour per run in figures
 
-# One-class models on all 95 features (CLAUDE.md §9 Step 3c): trained on good images only,
+# One-class models on all 95 features: trained on good images only,
 # default settings (no tuning). Each entry makes a new, untrained detector.
 ONE_CLASS_DETECTORS = {
     "Mahalanobis": lambda: LedoitWolf(),  # distance from the average good image (stabilised covariance)
@@ -239,7 +238,7 @@ ONE_CLASS_DETECTORS = {
     "LOF": lambda: LocalOutlierFactor(n_neighbors=20, novelty=True),  # density vs the 20 nearest good
 }
 
-# Supervised models on all 95 features (CLAUDE.md §9 Step 3b): learn from good AND defective training
+# Supervised models on all 95 features: learn from good AND defective training
 # images; class weights balance good vs defective; default settings (no tuning).
 SUPERVISED_MODELS = {
     "Logistic regression": lambda: make_pipeline(
@@ -260,7 +259,7 @@ DEEP_BACKBONES = {  # short name -> timm model name
 DEEP_FEATURES_DIR = Path("/home/qq/mfg_qc/data/features/deep")  # saved chunks per backbone (git-ignored)
 DEEP_BATCH_IMAGES = 4  # images per GPU batch (each = 12 tiles + 1 whole picture)
 
-# Anomaly detection (CLAUDE.md §9 Step 4): models that learn only from good tiles.
+# Anomaly detection: models that learn only from good tiles.
 # PatchCore (anomalib) on the 12 native 384-px tiles; about 45 min for all 4 runs on the GTX 1650
 PATCHCORE_BACKBONE = "resnet18.a1_in1k"  # fastest choice; the paper's wide_resnet50_2 would take ~2.3 h
 PATCHCORE_LAYERS = ["layer2", "layer3"]  # mid-level feature maps: 48 x 48 patches per tile, 128 + 256 numbers each
@@ -308,7 +307,7 @@ SCREEN_MODEL_DIR = Path("/home/qq/mfg_qc/data/models/max_rule_v2")  # git-ignore
 SCREEN_FOLDER = RAW_DIR / "F" / "F01"  # folder to screen (example: frozen milk F01, never trained on)
 SCREEN_SUFFIXES = (".png", ".jpg", ".jpeg", ".tif", ".tiff")  # picture files that are screened
 
-# CNNs (CLAUDE.md §9 Step 5): ImageNet networks fine-tuned with two outputs, good vs defective (T1) and
+# CNNs: ImageNet networks fine-tuned with two outputs, good vs defective (T1) and
 # which label (T2). Design A: the whole picture (WHOLE_SIZE). Trained in fp32: fp16 overflows in these
 # networks (NaN) and was 4x slower on the GTX 1650 (speed test: 22.5 training images/s, 1.75 GB GPU).
 CNN_BACKBONES = {"resnet18": "resnet18.a1_in1k",  # short name -> timm name (same weights as above)
@@ -351,7 +350,7 @@ def image_name(path: Path) -> str:
 
 
 def label_of(path: Path) -> str:
-    """Return the label of one raw image, read from its (unique) name (CLAUDE.md §7.2).
+    """Return the label of one raw image, read from its (unique) name.
 
     The folder is ignored on purpose: some files are stored in the wrong folder
     (e.g. A11 and A14 are inside A08/). Only the 3.2 % milk files take their preparation from
@@ -3640,7 +3639,7 @@ plt.show()
 # # Creating manifest
 #
 # One row per raw image (all 4605, incl. the 3.2 % milk; the excluded images are kept and flagged)
-# with its label, the preparation details from the preparation log (CLAUDE.md §7.4) and the fold
+# with its label, the preparation details from the preparation log and the fold
 # (§9 Step 6). F, U and M have no fold: they are test only. Saved to `data/manifest.csv`; later steps
 # read it.
 
@@ -3649,7 +3648,7 @@ data["MANIFEST"] = build_manifest(data["RAW_PICTURES"], set(data["EXCLUDED"]["fi
 data["MANIFEST"].head()
 
 # %%
-# Check: raw images per label vs CLAUDE.md §7.3, and images used (not excluded) per fold
+# Check: raw images per label and images used (not excluded) per fold
 m = data["MANIFEST"]
 manifest_check = m.groupby("label", sort=False).agg(raw=("file", "size"), excluded=("excluded", "sum"))
 manifest_check["expected_raw"] = pd.Series(EXPECTED_COUNTS)
@@ -3662,7 +3661,7 @@ manifest_check = manifest_check.join(
     used.pivot_table(index="label", columns="fold_name", values="file", aggfunc="size", fill_value=0)
 )
 if not manifest_check["ok"].all():
-    print("COUNTS DIFFER FROM CLAUDE.md §7.3 - check before going on!")
+    print("COUNTS DIFFER FROM check before going on!")
 manifest_check
 
 # %%
@@ -3809,7 +3808,7 @@ plt.show()
 # %% [markdown]
 # # Model data
 #
-# What the models get (CLAUDE.md §9 Step 2), for every image that is not excluded:
+# What the models get, for every image that is not excluded:
 # - the ROI cut into 12 tiles of 384 x 384 px (tile models, anomaly detection),
 # - the whole ROI (1536 x 1152 px) scaled to 768 x 576 px (whole-picture model).
 
@@ -3979,7 +3978,7 @@ load_options.round(1)
 # %% [markdown]
 # # Evaluation
 #
-# The same exam for every method (CLAUDE.md §9 Step 6):
+# The same exam for every method:
 # - 4 runs: test on fold k, choose the percentile threshold and settings on the validation fold
 #   (the next fold, cyclic), train on the other two folds. F and U are tested in every run.
 # - Every score is turned into a percentile of the good validation images; an image is flagged as
@@ -4025,15 +4024,14 @@ pd.Series(checks, name="ok")
 # %% [markdown]
 # # Classical methods
 #
-# Handcrafted features computed on every tile (CLAUDE.md §9 Step 3), then turned into a
+# Handcrafted features computed on every tile, then turned into a
 # good / defective decision.
 
 # %% [markdown]
 # ## Feature definitions
 #
-# **Notation.** A tile has $N = 384 \times 384$ pixels at positions $(x, y)$. $R, G, B \in [0, 255]$
+#  A tile has $N = 384 \times 384$ pixels at positions $(x, y)$. $R, G, B \in [0, 255]$
 # are the colour channels and $I(x, y) = 0.299R + 0.587G + 0.114B$ is the grey level (as in OpenCV).
-# $\ast$ is convolution (sliding a small weight matrix over the image).
 #
 # ### 1. Focus (sharpness)
 # A sharp tile has strong, sudden changes of brightness at globule edges; blur smooths them away.
@@ -4156,6 +4154,13 @@ example_features = pd.DataFrame({
 })  # rows = features, columns = labels
 print(f"{len(example_features)} features per tile")
 example_features[~example_features.index.str.startswith("hist_")].round(3)  # the 19 single values
+
+# %%
+example_features.info()
+
+# %%
+pd.set_option("display.max_rows", 100)
+example_features.round(3)
 
 # %%
 # What the focus and globule features "see": maps on the same scale for every label
@@ -4640,7 +4645,7 @@ pd.concat([
 # %% [markdown]
 # # Anomaly detection
 #
-# Models that learn only what good images look like (CLAUDE.md §9 Step 4) and flag everything that
+# Models that learn only what good images look like and flag everything that
 # differs, also changes they have never seen (e.g. frozen milk). They compare small patches, so they
 # also show *where* an image is unusual (anomaly map).
 
